@@ -100,6 +100,7 @@ def init_session_state() -> None:
         "display_size": None,
         "scale_factor": 1.0,
         "canvas_objects": [],
+        "saved_image_key": None,
         "restored_annotations_key": None,
         "annotation_table": [],
     }
@@ -138,6 +139,15 @@ def save_uploaded_image(uploaded_file: Any, image: Image.Image) -> Path:
     return destination
 
 
+def safe_float(value: Any, default: float | None = None) -> float | None:
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def canvas_object_label(obj: dict[str, Any], fallback_label: str) -> str:
     label = obj.get("label")
     if label in LABELS:
@@ -159,21 +169,31 @@ def normalize_canvas_object(
     created_at: str,
 ) -> dict[str, Any] | None:
     obj_type = obj.get("type")
+    if obj_type not in {"circle", "rect"}:
+        return None
+
     label = canvas_object_label(obj, fallback_label)
-    left = float(obj.get("left", 0))
-    top = float(obj.get("top", 0))
-    scale_x = float(obj.get("scaleX", 1))
-    scale_y = float(obj.get("scaleY", 1))
+    left = safe_float(obj.get("left"))
+    top = safe_float(obj.get("top"))
+    scale_x = safe_float(obj.get("scaleX"), 1.0)
+    scale_y = safe_float(obj.get("scaleY"), 1.0)
+
+    if None in (left, top, scale_x, scale_y):
+        return None
 
     if obj_type == "circle":
-        radius = float(obj.get("radius", 0))
+        radius = safe_float(obj.get("radius"))
+        if radius is None:
+            return None
         width = radius * 2 * scale_x
         height = radius * 2 * scale_y
     elif obj_type == "rect":
-        width = float(obj.get("width", 0)) * scale_x
-        height = float(obj.get("height", 0)) * scale_y
-    else:
-        return None
+        rect_width = safe_float(obj.get("width"))
+        rect_height = safe_float(obj.get("height"))
+        if None in (rect_width, rect_height):
+            return None
+        width = rect_width * scale_x
+        height = rect_height * scale_y
 
     if width <= 0 or height <= 0:
         return None
@@ -212,10 +232,10 @@ def annotations_from_canvas(
 def fabric_object_from_annotation(annotation: dict[str, Any], scale_factor: float) -> dict[str, Any]:
     label = annotation.get("label", "other")
     color = LABEL_COLORS.get(label, LABEL_COLORS["other"])
-    width = float(annotation.get("width", 0)) * scale_factor
-    height = float(annotation.get("height", 0)) * scale_factor
-    center_x = float(annotation.get("x", 0)) * scale_factor
-    center_y = float(annotation.get("y", 0)) * scale_factor
+    width = (safe_float(annotation.get("width"), 0.0) or 0.0) * scale_factor
+    height = (safe_float(annotation.get("height"), 0.0) or 0.0) * scale_factor
+    center_x = (safe_float(annotation.get("x"), 0.0) or 0.0) * scale_factor
+    center_y = (safe_float(annotation.get("y"), 0.0) or 0.0) * scale_factor
 
     return {
         "type": "rect",
@@ -321,17 +341,22 @@ def main() -> None:
         if uploaded_image:
             image = load_image(uploaded_image)
             display_image, scale_factor = make_display_image(image)
-            save_uploaded_image(uploaded_image, image)
 
             if st.session_state.image_name != uploaded_image.name:
                 st.session_state.canvas_objects = []
                 st.session_state.annotation_table = []
                 st.session_state.restored_annotations_key = None
+                st.session_state.saved_image_key = None
 
             st.session_state.image_name = uploaded_image.name
             st.session_state.image_original_size = image.size
             st.session_state.display_size = display_image.size
             st.session_state.scale_factor = scale_factor
+
+            image_key = f"{uploaded_image.name}:{uploaded_image.size}"
+            if st.session_state.saved_image_key != image_key:
+                save_uploaded_image(uploaded_image, image)
+                st.session_state.saved_image_key = image_key
 
             if uploaded_annotations:
                 restore_key = f"{uploaded_image.name}:{uploaded_annotations.name}:{uploaded_annotations.size}"
