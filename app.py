@@ -24,6 +24,19 @@ LABEL_COLORS = {
     "basophil": "#7b2cbf",
     "other": "#6c757d",
 }
+OBJECTIVE_MAGNIFICATIONS = ["20x", "40x", "other", "unknown"]
+STAINING_OPTIONS = ["H&E", "other", "unknown"]
+METADATA_FIELDS = [
+    "objective_magnification",
+    "staining",
+    "total_magnification",
+    "pixel_size_um",
+    "tissue_type",
+    "specimen_id",
+    "scanner_or_microscope",
+    "annotator",
+    "notes",
+]
 DATA_DIR = Path("data")
 IMAGE_DIR = DATA_DIR / "images"
 ANNOTATION_DIR = DATA_DIR / "annotations"
@@ -103,9 +116,24 @@ def init_session_state() -> None:
         "saved_image_key": None,
         "restored_annotations_key": None,
         "annotation_table": [],
+        "image_metadata": default_image_metadata(),
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
+
+
+def default_image_metadata() -> dict[str, str]:
+    return {
+        "objective_magnification": "unknown",
+        "staining": "unknown",
+        "total_magnification": "",
+        "pixel_size_um": "",
+        "tissue_type": "",
+        "specimen_id": "",
+        "scanner_or_microscope": "",
+        "annotator": "",
+        "notes": "",
+    }
 
 
 def load_image(uploaded_file: Any) -> Image.Image:
@@ -229,6 +257,26 @@ def annotations_from_canvas(
     return annotations
 
 
+def apply_metadata_to_annotations(
+    annotations: list[dict[str, Any]],
+    metadata: dict[str, Any],
+) -> list[dict[str, Any]]:
+    return [{**item, **metadata} for item in annotations]
+
+
+def filter_annotations_by_objective(
+    annotations: list[dict[str, Any]],
+    objective_filter: str,
+) -> list[dict[str, Any]]:
+    if objective_filter == "all":
+        return annotations
+    return [
+        item
+        for item in annotations
+        if item.get("objective_magnification", "unknown") == objective_filter
+    ]
+
+
 def fabric_object_from_annotation(annotation: dict[str, Any], scale_factor: float) -> dict[str, Any]:
     label = annotation.get("label", "other")
     color = LABEL_COLORS.get(label, LABEL_COLORS["other"])
@@ -278,7 +326,25 @@ def count_annotations(annotations: list[dict[str, Any]]) -> pd.DataFrame:
     return pd.DataFrame([{"label": label, "count": count} for label, count in counts.items()])
 
 
-def save_outputs(image_name: str, annotations: list[dict[str, Any]], counts_df: pd.DataFrame) -> tuple[Path, Path]:
+def counts_with_metadata(
+    counts_df: pd.DataFrame,
+    metadata: dict[str, Any],
+    objective_filter: str,
+) -> pd.DataFrame:
+    counts_with_context = counts_df.copy()
+    for field in METADATA_FIELDS:
+        counts_with_context[field] = metadata.get(field, "")
+    counts_with_context["export_objective_filter"] = objective_filter
+    return counts_with_context
+
+
+def save_outputs(
+    image_name: str,
+    annotations: list[dict[str, Any]],
+    counts_df: pd.DataFrame,
+    metadata: dict[str, Any],
+    objective_filter: str,
+) -> tuple[Path, Path]:
     annotation_path = ANNOTATION_DIR / "annotations.json"
     count_path = EXPORT_DIR / "counts.csv"
 
@@ -286,11 +352,17 @@ def save_outputs(image_name: str, annotations: list[dict[str, Any]], counts_df: 
         "image_name": image_name,
         "labels": LABELS,
         "label_colors": LABEL_COLORS,
+        "image_metadata": metadata,
+        "export_objective_filter": objective_filter,
         "annotations": annotations,
         "saved_at": datetime.now().isoformat(timespec="seconds"),
     }
     annotation_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    counts_df.to_csv(count_path, index=False, encoding="utf-8-sig")
+    counts_with_metadata(counts_df, metadata, objective_filter).to_csv(
+        count_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
     return annotation_path, count_path
 
 
@@ -301,6 +373,19 @@ def load_annotation_file(uploaded_file: Any) -> list[dict[str, Any]]:
     if isinstance(payload, dict):
         return payload.get("annotations", [])
     return []
+
+
+def metadata_from_restored_annotations(annotations: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not annotations:
+        return None
+    first_annotation = annotations[0]
+    metadata = {
+        field: first_annotation.get(field, "")
+        for field in METADATA_FIELDS
+    }
+    if metadata.get("objective_magnification") in OBJECTIVE_MAGNIFICATIONS:
+        return metadata
+    return None
 
 
 def render_controls() -> tuple[str, str, str, int]:
@@ -314,6 +399,66 @@ def render_controls() -> tuple[str, str, str, int]:
     )
     stroke_width = st.slider("Stroke width", min_value=1, max_value=8, value=3)
     return label, mode, LABEL_COLORS[label], stroke_width
+
+
+def render_metadata_inputs() -> dict[str, Any]:
+    st.subheader("Image metadata")
+
+    current_metadata = st.session_state.image_metadata
+    objective_magnification = st.selectbox(
+        "objective_magnification",
+        OBJECTIVE_MAGNIFICATIONS,
+        index=OBJECTIVE_MAGNIFICATIONS.index(
+            current_metadata.get("objective_magnification", "unknown")
+            if current_metadata.get("objective_magnification", "unknown") in OBJECTIVE_MAGNIFICATIONS
+            else "unknown"
+        ),
+    )
+    staining = st.selectbox(
+        "staining",
+        STAINING_OPTIONS,
+        index=STAINING_OPTIONS.index(
+            current_metadata.get("staining", "unknown")
+            if current_metadata.get("staining", "unknown") in STAINING_OPTIONS
+            else "unknown"
+        ),
+    )
+
+    metadata = {
+        "objective_magnification": objective_magnification,
+        "staining": staining,
+        "total_magnification": st.text_input(
+            "total_magnification",
+            value=str(current_metadata.get("total_magnification", "")),
+        ),
+        "pixel_size_um": st.text_input(
+            "pixel_size_um",
+            value=str(current_metadata.get("pixel_size_um", "")),
+        ),
+        "tissue_type": st.text_input(
+            "tissue_type",
+            value=str(current_metadata.get("tissue_type", "")),
+        ),
+        "specimen_id": st.text_input(
+            "specimen_id",
+            value=str(current_metadata.get("specimen_id", "")),
+        ),
+        "scanner_or_microscope": st.text_input(
+            "scanner_or_microscope",
+            value=str(current_metadata.get("scanner_or_microscope", "")),
+        ),
+        "annotator": st.text_input(
+            "annotator",
+            value=str(current_metadata.get("annotator", "")),
+        ),
+        "notes": st.text_area(
+            "notes",
+            value=str(current_metadata.get("notes", "")),
+            height=80,
+        ),
+    }
+    st.session_state.image_metadata = metadata
+    return metadata
 
 
 def main() -> None:
@@ -332,7 +477,15 @@ def main() -> None:
         st.subheader("Data")
         uploaded_image = st.file_uploader("Upload tissue image", type=["jpg", "jpeg", "png", "tif", "tiff"])
         uploaded_annotations = st.file_uploader("Restore annotations.json", type=["json"])
+        if uploaded_image and st.session_state.image_name != uploaded_image.name:
+            st.session_state.canvas_objects = []
+            st.session_state.annotation_table = []
+            st.session_state.restored_annotations_key = None
+            st.session_state.saved_image_key = None
+            st.session_state.image_metadata = default_image_metadata()
+
         active_label, drawing_mode, stroke_color, stroke_width = render_controls()
+        metadata = render_metadata_inputs()
 
         count_container = st.container()
         image_info_container = st.container()
@@ -347,6 +500,7 @@ def main() -> None:
                 st.session_state.annotation_table = []
                 st.session_state.restored_annotations_key = None
                 st.session_state.saved_image_key = None
+                st.session_state.image_metadata = default_image_metadata()
 
             st.session_state.image_name = uploaded_image.name
             st.session_state.image_original_size = image.size
@@ -366,6 +520,9 @@ def main() -> None:
             if uploaded_annotations and st.session_state.restored_annotations_key != restore_key:
                 restored = load_annotation_file(uploaded_annotations)
                 st.session_state.annotation_table = restored
+                restored_metadata = metadata_from_restored_annotations(restored)
+                if restored_metadata:
+                    st.session_state.image_metadata.update(restored_metadata)
                 st.session_state.canvas_objects = canvas_json_from_annotations(
                     restored,
                     display_image.size[0],
@@ -417,11 +574,19 @@ def main() -> None:
             st.subheader("Annotations")
             st.dataframe(pd.DataFrame(st.session_state.annotation_table), hide_index=True, use_container_width=True)
 
-    annotations = st.session_state.annotation_table
-    counts_df = count_annotations(annotations)
+    metadata = st.session_state.image_metadata
+    annotations = apply_metadata_to_annotations(st.session_state.annotation_table, metadata)
     save_disabled = not st.session_state.image_name
 
     with count_container:
+        objective_filter = st.selectbox(
+            "Export objective filter",
+            ["all", *OBJECTIVE_MAGNIFICATIONS],
+            index=0,
+            help="Use this to export only 20x or 40x annotations for future model training splits.",
+        )
+        export_annotations = filter_annotations_by_objective(annotations, objective_filter)
+        counts_df = count_annotations(export_annotations)
         st.subheader("Counts")
         st.dataframe(counts_df, hide_index=True, use_container_width=True)
 
@@ -433,13 +598,24 @@ def main() -> None:
 
     with action_container:
         if st.button("Save JSON / CSV", disabled=save_disabled, use_container_width=True):
-            annotation_path, count_path = save_outputs(st.session_state.image_name, annotations, counts_df)
+            annotation_path, count_path = save_outputs(
+                st.session_state.image_name,
+                export_annotations,
+                counts_df,
+                metadata,
+                objective_filter,
+            )
             st.success(f"Saved: {annotation_path} / {count_path}")
 
         st.download_button(
             "Download annotations.json",
             data=json.dumps(
-                {"image_name": st.session_state.image_name, "annotations": annotations},
+                {
+                    "image_name": st.session_state.image_name,
+                    "image_metadata": metadata,
+                    "export_objective_filter": objective_filter,
+                    "annotations": export_annotations,
+                },
                 ensure_ascii=False,
                 indent=2,
             ),
@@ -450,7 +626,7 @@ def main() -> None:
         )
         st.download_button(
             "Download counts.csv",
-            data=counts_df.to_csv(index=False).encode("utf-8-sig"),
+            data=counts_with_metadata(counts_df, metadata, objective_filter).to_csv(index=False).encode("utf-8-sig"),
             file_name="counts.csv",
             mime="text/csv",
             disabled=save_disabled,
