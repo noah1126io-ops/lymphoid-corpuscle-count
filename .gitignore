@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+.streamlit/
+
+# Keep directory structure, but do not publish research images or generated data.
+data/images/*
+data/annotations/*
+data/exports/*
+!data/images/.gitkeep
+!data/annotations/.gitkeep
+!data/exports/.gitkeep
