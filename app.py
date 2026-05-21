@@ -293,6 +293,8 @@ def init_session_state() -> None:
         "saved_image_key": None,
         "restored_annotations_key": None,
         "annotation_table": [],
+        "canvas_key_version": 0,
+        "last_saved_message": "",
         "project_template": "ECRS_nasal_polyp",
         "image_metadata": default_image_metadata("ECRS_nasal_polyp"),
         "region_annotations": default_region_annotations(),
@@ -878,6 +880,7 @@ def reset_for_new_image() -> None:
     st.session_state.saved_image_key = None
     st.session_state.image_metadata = default_image_metadata(st.session_state.project_template)
     st.session_state.region_annotations = default_region_annotations()
+    st.session_state.canvas_key_version += 1
 
 
 def render_sidebar() -> tuple[Any, Any, str, dict[str, Any], dict[str, Any], str, str, str, int, bool]:
@@ -954,6 +957,7 @@ def process_upload(uploaded_image: Any, uploaded_annotations: Any, display_image
                 st.session_state.scale_factor,
             )["objects"]
             st.session_state.restored_annotations_key = restore_key
+            st.session_state.canvas_key_version += 1
 
 
 def main() -> None:
@@ -1001,7 +1005,7 @@ def main() -> None:
 
     st.caption(
         "Draw one or more annotations, then click the leftmost toolbar icon on the canvas "
-        "to sync counts and exports. This avoids canvas resets during the second annotation."
+        "to sync counts and exports. Saving will refresh the canvas safely before more drawing."
     )
     canvas_result = st_canvas(
         fill_color="rgba(255, 255, 255, 0)",
@@ -1013,7 +1017,7 @@ def main() -> None:
         height=canvas_height,
         width=canvas_width,
         drawing_mode=drawing_mode,
-        key=f"canvas_{st.session_state.image_name}",
+        key=f"canvas_{st.session_state.image_name}_{st.session_state.canvas_key_version}",
     )
 
     if canvas_result.json_data:
@@ -1069,6 +1073,14 @@ def main() -> None:
         st.dataframe(counts_df, hide_index=True, use_container_width=True)
 
     save_disabled = not st.session_state.image_name
+    if st.session_state.last_saved_message:
+        st.success(st.session_state.last_saved_message)
+        st.session_state.last_saved_message = ""
+
+    if st.button("Refresh canvas", disabled=save_disabled, use_container_width=True):
+        st.session_state.canvas_key_version += 1
+        st.rerun()
+
     if st.button("Save exports", disabled=save_disabled, use_container_width=True):
         paths = save_outputs(
             st.session_state.image_name,
@@ -1081,7 +1093,9 @@ def main() -> None:
             objective_filter,
             exclude_ignore_from_yolo,
         )
-        st.success("Saved: " + " / ".join(str(path) for path in paths.values()))
+        st.session_state.last_saved_message = "Saved: " + " / ".join(str(path) for path in paths.values())
+        st.session_state.canvas_key_version += 1
+        st.rerun()
 
     download_payload = {
         "schema_version": "2.0",
