@@ -7,6 +7,9 @@ __pycache__/
 data/images/*
 data/annotations/*
 data/exports/*
+data/exports/yolo_labels/*
 !data/images/.gitkeep
 !data/annotations/.gitkeep
 !data/exports/.gitkeep
+!data/exports/yolo_labels/
+!data/exports/yolo_labels/.gitkeep
