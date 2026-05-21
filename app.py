@@ -999,13 +999,17 @@ def main() -> None:
         "height": canvas_height,
     }
 
+    st.caption(
+        "Draw one or more annotations, then click the leftmost toolbar icon on the canvas "
+        "to sync counts and exports. This avoids canvas resets during the second annotation."
+    )
     canvas_result = st_canvas(
         fill_color="rgba(255, 255, 255, 0)",
         stroke_width=stroke_width,
         stroke_color=stroke_color,
         background_image=display_image,
         initial_drawing=initial_json,
-        update_streamlit=True,
+        update_streamlit=False,
         height=canvas_height,
         width=canvas_width,
         drawing_mode=drawing_mode,
