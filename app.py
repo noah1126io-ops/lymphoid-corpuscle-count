@@ -9,38 +9,183 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
+import streamlit_drawable_canvas as drawable_canvas
+from PIL import Image, ImageOps
 from streamlit.elements.lib import image_utils
 from streamlit.elements.lib.layout_utils import LayoutConfig
-from PIL import Image, ImageOps
-import streamlit_drawable_canvas as drawable_canvas
 from streamlit_drawable_canvas import st_canvas
 
 
 APP_TITLE = "Manual Granulocyte Annotation Tool"
-LABELS = ["eosinophil", "neutrophil", "basophil", "other"]
+
+PROJECT_TEMPLATES = [
+    "ECRS_nasal_polyp",
+    "CRS_sinonasal_mucosa",
+    "EoE_esophagus_reference",
+    "GI_eosinophilia_reference",
+    "generic_granulocyte",
+    "custom",
+]
+DISEASE_CONTEXTS = ["ECRS", "CRSwNP", "CRSsNP", "control", "unknown"]
+TISSUE_TYPES = [
+    "nasal_polyp",
+    "sinonasal_mucosa",
+    "inferior_turbinate",
+    "other",
+    "unknown",
+]
+ANATOMICAL_SITES = [
+    "ethmoid_sinus",
+    "maxillary_sinus",
+    "nasal_cavity",
+    "other",
+    "unknown",
+]
+STAINING_OPTIONS = ["H&E", "other", "unknown"]
+OBJECTIVE_MAGNIFICATIONS = ["20x", "40x", "other", "unknown"]
+SECTION_QUALITY_OPTIONS = ["good", "acceptable", "poor"]
+REGION_TYPES = [
+    "epithelium",
+    "lamina_propria",
+    "glandular_area",
+    "vascular_area",
+    "mucus",
+    "blood_clot",
+    "necrosis",
+    "artifact",
+    "unknown",
+]
+
+LABELS = [
+    "eosinophil",
+    "neutrophil",
+    "basophil",
+    "mast_cell",
+    "lymphocyte",
+    "plasma_cell",
+    "other_cell",
+    "artifact",
+    "ignore",
+]
+PRIMARY_LABELS = ["eosinophil", "other_cell", "artifact", "ignore"]
 LABEL_COLORS = {
     "eosinophil": "#e83e8c",
     "neutrophil": "#2f80ed",
     "basophil": "#7b2cbf",
-    "other": "#6c757d",
+    "mast_cell": "#f2994a",
+    "lymphocyte": "#219653",
+    "plasma_cell": "#56ccf2",
+    "other_cell": "#6c757d",
+    "artifact": "#8d6e63",
+    "ignore": "#111827",
 }
-OBJECTIVE_MAGNIFICATIONS = ["20x", "40x", "other", "unknown"]
-STAINING_OPTIONS = ["H&E", "other", "unknown"]
+YOLO_CLASS_IDS = {
+    "eosinophil": 0,
+    "neutrophil": 1,
+    "basophil": 2,
+    "mast_cell": 3,
+    "lymphocyte": 4,
+    "plasma_cell": 5,
+    "other_cell": 6,
+    "artifact": 7,
+    "ignore": 8,
+}
+
 METADATA_FIELDS = [
-    "objective_magnification",
-    "staining",
-    "total_magnification",
-    "pixel_size_um",
+    "project_template",
+    "disease_context",
     "tissue_type",
+    "staining",
+    "objective_magnification",
     "specimen_id",
-    "scanner_or_microscope",
+    "slide_id",
     "annotator",
+    "patient_id_hash",
+    "anatomical_site",
+    "scanner_or_microscope",
+    "pixel_size_um",
+    "hpf_area_mm2",
+    "hpf_diameter_mm",
+    "section_quality",
     "notes",
 ]
+MANIFEST_FIELDS = [
+    "image_name",
+    "original_image_path",
+    "project_template",
+    "disease_context",
+    "tissue_type",
+    "staining",
+    "objective_magnification",
+    "pixel_size_um",
+    "hpf_area_mm2",
+    "annotator",
+    "annotation_count",
+    "eosinophil_count",
+    "saved_at",
+]
+TEMPLATE_DEFAULTS = {
+    "ECRS_nasal_polyp": {
+        "project_template": "ECRS_nasal_polyp",
+        "disease_context": "ECRS",
+        "tissue_type": "nasal_polyp",
+        "staining": "H&E",
+        "objective_magnification": "40x",
+        "anatomical_site": "unknown",
+        "section_quality": "good",
+    },
+    "CRS_sinonasal_mucosa": {
+        "project_template": "CRS_sinonasal_mucosa",
+        "disease_context": "unknown",
+        "tissue_type": "sinonasal_mucosa",
+        "staining": "H&E",
+        "objective_magnification": "40x",
+        "anatomical_site": "unknown",
+        "section_quality": "good",
+    },
+    "EoE_esophagus_reference": {
+        "project_template": "EoE_esophagus_reference",
+        "disease_context": "unknown",
+        "tissue_type": "other",
+        "staining": "H&E",
+        "objective_magnification": "40x",
+        "anatomical_site": "other",
+        "section_quality": "good",
+    },
+    "GI_eosinophilia_reference": {
+        "project_template": "GI_eosinophilia_reference",
+        "disease_context": "unknown",
+        "tissue_type": "other",
+        "staining": "H&E",
+        "objective_magnification": "40x",
+        "anatomical_site": "other",
+        "section_quality": "good",
+    },
+    "generic_granulocyte": {
+        "project_template": "generic_granulocyte",
+        "disease_context": "unknown",
+        "tissue_type": "unknown",
+        "staining": "H&E",
+        "objective_magnification": "unknown",
+        "anatomical_site": "unknown",
+        "section_quality": "good",
+    },
+    "custom": {
+        "project_template": "custom",
+        "disease_context": "unknown",
+        "tissue_type": "unknown",
+        "staining": "unknown",
+        "objective_magnification": "unknown",
+        "anatomical_site": "unknown",
+        "section_quality": "good",
+    },
+}
+
 DATA_DIR = Path("data")
 IMAGE_DIR = DATA_DIR / "images"
 ANNOTATION_DIR = DATA_DIR / "annotations"
 EXPORT_DIR = DATA_DIR / "exports"
+YOLO_DIR = EXPORT_DIR / "yolo_labels"
 MAX_DISPLAY_WIDTH = 1100
 MAX_DISPLAY_HEIGHT = 900
 
@@ -51,6 +196,7 @@ Image.MAX_IMAGE_PIXELS = None
 
 def patch_drawable_canvas_for_streamlit() -> None:
     """Keep streamlit-drawable-canvas working with newer Streamlit versions."""
+
     def image_to_url(
         image: Image.Image,
         width: int,
@@ -102,13 +248,44 @@ def disable_canvas_context_menu() -> None:
 
 
 def ensure_directories() -> None:
-    for path in (IMAGE_DIR, ANNOTATION_DIR, EXPORT_DIR):
+    for path in (IMAGE_DIR, ANNOTATION_DIR, EXPORT_DIR, YOLO_DIR):
         path.mkdir(parents=True, exist_ok=True)
+
+
+def default_image_metadata(project_template: str = "ECRS_nasal_polyp") -> dict[str, str]:
+    metadata = {
+        "project_template": project_template,
+        "disease_context": "unknown",
+        "tissue_type": "unknown",
+        "staining": "unknown",
+        "objective_magnification": "unknown",
+        "specimen_id": "",
+        "slide_id": "",
+        "annotator": "",
+        "patient_id_hash": "",
+        "anatomical_site": "unknown",
+        "scanner_or_microscope": "",
+        "pixel_size_um": "",
+        "hpf_area_mm2": "",
+        "hpf_diameter_mm": "",
+        "section_quality": "good",
+        "notes": "",
+    }
+    metadata.update(TEMPLATE_DEFAULTS.get(project_template, TEMPLATE_DEFAULTS["custom"]))
+    return metadata
+
+
+def default_region_annotations(region_type: str = "unknown") -> dict[str, Any]:
+    return {
+        "global_region_type": region_type,
+        "regions": [],
+    }
 
 
 def init_session_state() -> None:
     defaults = {
         "image_name": None,
+        "original_image_path": "",
         "image_original_size": None,
         "display_size": None,
         "scale_factor": 1.0,
@@ -116,24 +293,13 @@ def init_session_state() -> None:
         "saved_image_key": None,
         "restored_annotations_key": None,
         "annotation_table": [],
-        "image_metadata": default_image_metadata(),
+        "project_template": "ECRS_nasal_polyp",
+        "image_metadata": default_image_metadata("ECRS_nasal_polyp"),
+        "region_annotations": default_region_annotations(),
+        "last_template": "ECRS_nasal_polyp",
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
-
-
-def default_image_metadata() -> dict[str, str]:
-    return {
-        "objective_magnification": "unknown",
-        "staining": "unknown",
-        "total_magnification": "",
-        "pixel_size_um": "",
-        "tissue_type": "",
-        "specimen_id": "",
-        "scanner_or_microscope": "",
-        "annotator": "",
-        "notes": "",
-    }
 
 
 def load_image(uploaded_file: Any) -> Image.Image:
@@ -159,7 +325,7 @@ def make_display_image(image: Image.Image) -> tuple[Image.Image, float]:
     return display_image, scale_factor
 
 
-def save_uploaded_image(uploaded_file: Any, image: Image.Image) -> Path:
+def save_uploaded_image(uploaded_file: Any) -> Path:
     destination = IMAGE_DIR / uploaded_file.name
     uploaded_file.seek(0)
     with destination.open("wb") as output_file:
@@ -174,6 +340,12 @@ def safe_float(value: Any, default: float | None = None) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def safe_round(value: float | None, digits: int = 3) -> float | None:
+    if value is None:
+        return None
+    return round(value, digits)
 
 
 def canvas_object_label(obj: dict[str, Any], fallback_label: str) -> str:
@@ -194,6 +366,7 @@ def normalize_canvas_object(
     image_name: str,
     scale_factor: float,
     fallback_label: str,
+    region_type: str,
     created_at: str,
 ) -> dict[str, Any] | None:
     obj_type = obj.get("type")
@@ -213,27 +386,43 @@ def normalize_canvas_object(
         radius = safe_float(obj.get("radius"))
         if radius is None:
             return None
-        width = radius * 2 * scale_x
-        height = radius * 2 * scale_y
-    elif obj_type == "rect":
+        width_display = radius * 2 * scale_x
+        height_display = radius * 2 * scale_y
+    else:
         rect_width = safe_float(obj.get("width"))
         rect_height = safe_float(obj.get("height"))
         if None in (rect_width, rect_height):
             return None
-        width = rect_width * scale_x
-        height = rect_height * scale_y
+        width_display = rect_width * scale_x
+        height_display = rect_height * scale_y
 
-    if width <= 0 or height <= 0:
+    if width_display <= 0 or height_display <= 0:
         return None
 
     inverse_scale = 1 / scale_factor
+    x_display = left + width_display / 2
+    y_display = top + height_display / 2
+    width_original = width_display * inverse_scale
+    height_original = height_display * inverse_scale
+    x_original = x_display * inverse_scale
+    y_original = y_display * inverse_scale
+
     return {
         "image_name": image_name,
         "label": label,
-        "x": round((left + width / 2) * inverse_scale, 3),
-        "y": round((top + height / 2) * inverse_scale, 3),
-        "width": round(width * inverse_scale, 3),
-        "height": round(height * inverse_scale, 3),
+        # Backward-compatible aliases.
+        "x": safe_round(x_original),
+        "y": safe_round(y_original),
+        "width": safe_round(width_original),
+        "height": safe_round(height_original),
+        "x_original": safe_round(x_original),
+        "y_original": safe_round(y_original),
+        "bbox_width_original": safe_round(width_original),
+        "bbox_height_original": safe_round(height_original),
+        "x_in_display": safe_round(x_display),
+        "y_in_display": safe_round(y_display),
+        "scale_factor": safe_round(scale_factor, 6),
+        "region_type": region_type,
         "confidence": 1.0,
         "created_at": obj.get("created_at", created_at),
     }
@@ -244,6 +433,7 @@ def annotations_from_canvas(
     image_name: str | None,
     scale_factor: float,
     fallback_label: str,
+    region_type: str,
 ) -> list[dict[str, Any]]:
     if not canvas_json or not image_name:
         return []
@@ -251,17 +441,26 @@ def annotations_from_canvas(
     created_at = datetime.now().isoformat(timespec="seconds")
     annotations = []
     for obj in canvas_json.get("objects", []):
-        annotation = normalize_canvas_object(obj, image_name, scale_factor, fallback_label, created_at)
+        annotation = normalize_canvas_object(
+            obj,
+            image_name,
+            scale_factor,
+            fallback_label,
+            region_type,
+            created_at,
+        )
         if annotation:
             annotations.append(annotation)
     return annotations
 
 
-def apply_metadata_to_annotations(
+def apply_context_to_annotations(
     annotations: list[dict[str, Any]],
     metadata: dict[str, Any],
+    region_annotations: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    return [{**item, **metadata} for item in annotations]
+    region_type = region_annotations.get("global_region_type", "unknown")
+    return [{**item, **metadata, "region_type": item.get("region_type", region_type)} for item in annotations]
 
 
 def filter_annotations_by_objective(
@@ -278,12 +477,24 @@ def filter_annotations_by_objective(
 
 
 def fabric_object_from_annotation(annotation: dict[str, Any], scale_factor: float) -> dict[str, Any]:
-    label = annotation.get("label", "other")
-    color = LABEL_COLORS.get(label, LABEL_COLORS["other"])
-    width = (safe_float(annotation.get("width"), 0.0) or 0.0) * scale_factor
-    height = (safe_float(annotation.get("height"), 0.0) or 0.0) * scale_factor
-    center_x = (safe_float(annotation.get("x"), 0.0) or 0.0) * scale_factor
-    center_y = (safe_float(annotation.get("y"), 0.0) or 0.0) * scale_factor
+    label = annotation.get("label", "ignore")
+    color = LABEL_COLORS.get(label, LABEL_COLORS["ignore"])
+    width = (
+        safe_float(annotation.get("bbox_width_original"), safe_float(annotation.get("width"), 0.0))
+        or 0.0
+    ) * scale_factor
+    height = (
+        safe_float(annotation.get("bbox_height_original"), safe_float(annotation.get("height"), 0.0))
+        or 0.0
+    ) * scale_factor
+    center_x = (
+        safe_float(annotation.get("x_original"), safe_float(annotation.get("x"), 0.0))
+        or 0.0
+    ) * scale_factor
+    center_y = (
+        safe_float(annotation.get("y_original"), safe_float(annotation.get("y"), 0.0))
+        or 0.0
+    ) * scale_factor
 
     return {
         "type": "rect",
@@ -316,149 +527,433 @@ def canvas_json_from_annotations(
     }
 
 
-def count_annotations(annotations: list[dict[str, Any]]) -> pd.DataFrame:
-    counts = {label: 0 for label in LABELS}
+def image_area_mm2_from_pixel_size(
+    image_size: tuple[int, int] | None,
+    pixel_size_um: Any,
+) -> float | None:
+    pixel_size = safe_float(pixel_size_um)
+    if not image_size or not pixel_size or pixel_size <= 0:
+        return None
+    image_width, image_height = image_size
+    return (image_width * pixel_size / 1000) * (image_height * pixel_size / 1000)
+
+
+def calculate_ecrs_counts(
+    annotations: list[dict[str, Any]],
+    metadata: dict[str, Any],
+    image_size: tuple[int, int] | None = None,
+) -> dict[str, Any]:
+    total_count = len([item for item in annotations if item.get("label") != "ignore"])
+    eos_count = sum(1 for item in annotations if item.get("label") == "eosinophil")
+    ratio = eos_count / total_count if total_count else 0.0
+    hpf_area = safe_float(metadata.get("hpf_area_mm2"))
+    image_area = image_area_mm2_from_pixel_size(image_size, metadata.get("pixel_size_um"))
+    area_for_density = hpf_area or image_area
+    eos_per_mm2 = round(eos_count / area_for_density, 6) if area_for_density and area_for_density > 0 else "not_calculated"
+    eos_per_hpf = (
+        round(eos_per_mm2 * hpf_area, 6)
+        if isinstance(eos_per_mm2, float) and hpf_area and hpf_area > 0
+        else "not_calculated"
+    )
+
+    return {
+        "eosinophil_count": eos_count,
+        "total_annotated_count": total_count,
+        "eosinophil_ratio": round(ratio, 6),
+        "eos_per_HPF": eos_per_hpf,
+        "eos_per_mm2": eos_per_mm2,
+    }
+
+
+def count_annotations(
+    annotations: list[dict[str, Any]],
+    metadata: dict[str, Any],
+    image_size: tuple[int, int] | None = None,
+) -> pd.DataFrame:
+    label_counts = {label: 0 for label in LABELS}
     for item in annotations:
         label = item.get("label")
-        if label in counts:
-            counts[label] += 1
-    counts["total"] = sum(counts.values())
-    return pd.DataFrame([{"label": label, "count": count} for label, count in counts.items()])
+        if label in label_counts:
+            label_counts[label] += 1
+
+    rows = [{"metric": f"label_{label}_count", "value": count} for label, count in label_counts.items()]
+    ecrs_counts = calculate_ecrs_counts(annotations, metadata, image_size)
+    rows.extend({"metric": key, "value": value} for key, value in ecrs_counts.items())
+    return pd.DataFrame(rows)
+
+
+def annotations_dataframe(annotations: list[dict[str, Any]]) -> pd.DataFrame:
+    if not annotations:
+        return pd.DataFrame()
+    return pd.DataFrame(annotations)
 
 
 def counts_with_metadata(
     counts_df: pd.DataFrame,
     metadata: dict[str, Any],
+    region_annotations: dict[str, Any],
     objective_filter: str,
 ) -> pd.DataFrame:
     counts_with_context = counts_df.copy()
     for field in METADATA_FIELDS:
         counts_with_context[field] = metadata.get(field, "")
+    counts_with_context["global_region_type"] = region_annotations.get("global_region_type", "unknown")
     counts_with_context["export_objective_filter"] = objective_filter
     return counts_with_context
 
 
+def dataset_manifest_row(
+    image_name: str,
+    original_image_path: str,
+    metadata: dict[str, Any],
+    annotations: list[dict[str, Any]],
+    saved_at: str,
+) -> dict[str, Any]:
+    ecrs_counts = calculate_ecrs_counts(annotations, metadata)
+    return {
+        "image_name": image_name,
+        "original_image_path": original_image_path,
+        "project_template": metadata.get("project_template", ""),
+        "disease_context": metadata.get("disease_context", ""),
+        "tissue_type": metadata.get("tissue_type", ""),
+        "staining": metadata.get("staining", ""),
+        "objective_magnification": metadata.get("objective_magnification", ""),
+        "pixel_size_um": metadata.get("pixel_size_um", ""),
+        "hpf_area_mm2": metadata.get("hpf_area_mm2", ""),
+        "annotator": metadata.get("annotator", ""),
+        "annotation_count": len(annotations),
+        "eosinophil_count": ecrs_counts["eosinophil_count"],
+        "saved_at": saved_at,
+    }
+
+
+def yolo_lines(
+    annotations: list[dict[str, Any]],
+    image_size: tuple[int, int] | None,
+    exclude_ignore: bool,
+) -> list[str]:
+    if not image_size:
+        return []
+    image_width, image_height = image_size
+    if image_width <= 0 or image_height <= 0:
+        return []
+
+    lines = []
+    for item in annotations:
+        label = item.get("label")
+        if exclude_ignore and label == "ignore":
+            continue
+        if label not in YOLO_CLASS_IDS:
+            continue
+        x_center = safe_float(item.get("x_original"), safe_float(item.get("x")))
+        y_center = safe_float(item.get("y_original"), safe_float(item.get("y")))
+        box_width = safe_float(item.get("bbox_width_original"), safe_float(item.get("width")))
+        box_height = safe_float(item.get("bbox_height_original"), safe_float(item.get("height")))
+        if None in (x_center, y_center, box_width, box_height):
+            continue
+        lines.append(
+            " ".join(
+                [
+                    str(YOLO_CLASS_IDS[label]),
+                    f"{x_center / image_width:.6f}",
+                    f"{y_center / image_height:.6f}",
+                    f"{box_width / image_width:.6f}",
+                    f"{box_height / image_height:.6f}",
+                ]
+            )
+        )
+    return lines
+
+
 def save_outputs(
     image_name: str,
+    original_image_path: str,
+    image_size: tuple[int, int] | None,
     annotations: list[dict[str, Any]],
     counts_df: pd.DataFrame,
     metadata: dict[str, Any],
+    region_annotations: dict[str, Any],
     objective_filter: str,
-) -> tuple[Path, Path]:
+    exclude_ignore_from_yolo: bool,
+) -> dict[str, Path]:
+    saved_at = datetime.now().isoformat(timespec="seconds")
     annotation_path = ANNOTATION_DIR / "annotations.json"
+    annotation_csv_path = EXPORT_DIR / "annotations.csv"
     count_path = EXPORT_DIR / "counts.csv"
+    manifest_path = EXPORT_DIR / "dataset_manifest.csv"
+    yolo_path = YOLO_DIR / f"{Path(image_name).stem}.txt"
 
     payload = {
+        "schema_version": "2.0",
         "image_name": image_name,
+        "original_image_path": original_image_path,
         "labels": LABELS,
+        "primary_labels": PRIMARY_LABELS,
         "label_colors": LABEL_COLORS,
+        "yolo_class_ids": YOLO_CLASS_IDS,
         "image_metadata": metadata,
+        "region_annotations": region_annotations,
         "export_objective_filter": objective_filter,
         "annotations": annotations,
-        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "saved_at": saved_at,
     }
     annotation_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    counts_with_metadata(counts_df, metadata, objective_filter).to_csv(
+    annotations_dataframe(annotations).to_csv(annotation_csv_path, index=False, encoding="utf-8-sig")
+    counts_with_metadata(counts_df, metadata, region_annotations, objective_filter).to_csv(
         count_path,
         index=False,
         encoding="utf-8-sig",
     )
-    return annotation_path, count_path
+    pd.DataFrame(
+        [dataset_manifest_row(image_name, original_image_path, metadata, annotations, saved_at)],
+        columns=MANIFEST_FIELDS,
+    ).to_csv(manifest_path, index=False, encoding="utf-8-sig")
+    yolo_path.write_text(
+        "\n".join(yolo_lines(annotations, image_size, exclude_ignore_from_yolo)),
+        encoding="utf-8",
+    )
+
+    return {
+        "annotations_json": annotation_path,
+        "annotations_csv": annotation_csv_path,
+        "counts_csv": count_path,
+        "dataset_manifest_csv": manifest_path,
+        "yolo_labels": yolo_path,
+    }
 
 
-def load_annotation_file(uploaded_file: Any) -> list[dict[str, Any]]:
+def load_annotation_payload(uploaded_file: Any) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
     payload = json.loads(uploaded_file.getvalue().decode("utf-8"))
     if isinstance(payload, list):
-        return payload
+        return payload, {}, default_region_annotations()
     if isinstance(payload, dict):
-        return payload.get("annotations", [])
-    return []
+        annotations = payload.get("annotations", [])
+        metadata = payload.get("image_metadata") or metadata_from_restored_annotations(annotations) or {}
+        region_annotations = payload.get("region_annotations") or default_region_annotations()
+        return annotations, metadata, region_annotations
+    return [], {}, default_region_annotations()
 
 
 def metadata_from_restored_annotations(annotations: list[dict[str, Any]]) -> dict[str, Any] | None:
     if not annotations:
         return None
     first_annotation = annotations[0]
-    metadata = {
-        field: first_annotation.get(field, "")
-        for field in METADATA_FIELDS
-    }
-    if metadata.get("objective_magnification") in OBJECTIVE_MAGNIFICATIONS:
+    metadata = {field: first_annotation.get(field, "") for field in METADATA_FIELDS}
+    if metadata.get("project_template"):
         return metadata
     return None
 
 
-def render_controls() -> tuple[str, str, str, int]:
-    st.subheader("Annotation")
-    label = st.radio("Active label", LABELS, captions=[LABEL_COLORS[item] for item in LABELS])
-    mode = st.selectbox(
-        "Drawing mode",
+def select_index(options: list[str], value: Any, fallback: str) -> int:
+    value = value if value in options else fallback
+    return options.index(value)
+
+
+def render_project_template() -> str:
+    st.sidebar.subheader("Project Template")
+    current_template = st.session_state.project_template
+    project_template = st.sidebar.selectbox(
+        "project_template",
+        PROJECT_TEMPLATES,
+        index=select_index(PROJECT_TEMPLATES, current_template, "ECRS_nasal_polyp"),
+    )
+    if project_template != st.session_state.last_template:
+        existing = st.session_state.image_metadata.copy()
+        defaults = default_image_metadata(project_template)
+        # Preserve user-entered identifiers while applying template recommendations.
+        for field in ["specimen_id", "slide_id", "annotator", "patient_id_hash", "notes"]:
+            defaults[field] = existing.get(field, defaults.get(field, ""))
+        st.session_state.project_template = project_template
+        st.session_state.image_metadata = defaults
+        st.session_state.last_template = project_template
+    return project_template
+
+
+def render_metadata_inputs(project_template: str) -> dict[str, Any]:
+    st.sidebar.subheader("Image Metadata")
+    current = st.session_state.image_metadata
+    current["project_template"] = project_template
+
+    metadata = {
+        "project_template": project_template,
+        "disease_context": st.sidebar.selectbox(
+            "disease_context *",
+            DISEASE_CONTEXTS,
+            index=select_index(DISEASE_CONTEXTS, current.get("disease_context"), "unknown"),
+        ),
+        "tissue_type": st.sidebar.selectbox(
+            "tissue_type *",
+            TISSUE_TYPES,
+            index=select_index(TISSUE_TYPES, current.get("tissue_type"), "unknown"),
+        ),
+        "staining": st.sidebar.selectbox(
+            "staining *",
+            STAINING_OPTIONS,
+            index=select_index(STAINING_OPTIONS, current.get("staining"), "unknown"),
+        ),
+        "objective_magnification": st.sidebar.selectbox(
+            "objective_magnification *",
+            OBJECTIVE_MAGNIFICATIONS,
+            index=select_index(
+                OBJECTIVE_MAGNIFICATIONS,
+                current.get("objective_magnification"),
+                "unknown",
+            ),
+        ),
+        "specimen_id": st.sidebar.text_input("specimen_id *", value=str(current.get("specimen_id", ""))),
+        "slide_id": st.sidebar.text_input("slide_id *", value=str(current.get("slide_id", ""))),
+        "annotator": st.sidebar.text_input("annotator *", value=str(current.get("annotator", ""))),
+        "patient_id_hash": st.sidebar.text_input("patient_id_hash", value=str(current.get("patient_id_hash", ""))),
+        "anatomical_site": st.sidebar.selectbox(
+            "anatomical_site",
+            ANATOMICAL_SITES,
+            index=select_index(ANATOMICAL_SITES, current.get("anatomical_site"), "unknown"),
+        ),
+        "scanner_or_microscope": st.sidebar.text_input(
+            "scanner_or_microscope",
+            value=str(current.get("scanner_or_microscope", "")),
+        ),
+        "pixel_size_um": st.sidebar.text_input("pixel_size_um", value=str(current.get("pixel_size_um", ""))),
+        "hpf_area_mm2": st.sidebar.text_input("hpf_area_mm2", value=str(current.get("hpf_area_mm2", ""))),
+        "hpf_diameter_mm": st.sidebar.text_input(
+            "hpf_diameter_mm",
+            value=str(current.get("hpf_diameter_mm", "")),
+        ),
+        "section_quality": st.sidebar.selectbox(
+            "section_quality",
+            SECTION_QUALITY_OPTIONS,
+            index=select_index(SECTION_QUALITY_OPTIONS, current.get("section_quality"), "good"),
+        ),
+        "notes": st.sidebar.text_area("notes", value=str(current.get("notes", "")), height=80),
+    }
+    st.session_state.image_metadata = metadata
+    return metadata
+
+
+def render_region_type() -> dict[str, Any]:
+    st.sidebar.subheader("Region Type")
+    current_region = st.session_state.region_annotations.get("global_region_type", "unknown")
+    region_type = st.sidebar.selectbox(
+        "global_region_type",
+        REGION_TYPES,
+        index=select_index(REGION_TYPES, current_region, "unknown"),
+    )
+    region_annotations = {
+        "global_region_type": region_type,
+        "regions": st.session_state.region_annotations.get("regions", []),
+    }
+    st.session_state.region_annotations = region_annotations
+    return region_annotations
+
+
+def render_label_controls() -> tuple[str, str, str, int]:
+    st.sidebar.subheader("Active Label")
+    quick_label = st.sidebar.radio(
+        "Common labels",
+        PRIMARY_LABELS,
+        captions=[LABEL_COLORS[label] for label in PRIMARY_LABELS],
+    )
+    active_label = st.sidebar.selectbox(
+        "All labels",
+        LABELS,
+        index=LABELS.index(quick_label),
+        help="Initial ECRS evaluation focuses on eosinophil vs other/ignore.",
+    )
+
+    st.sidebar.subheader("Drawing Mode")
+    drawing_mode = st.sidebar.selectbox(
+        "drawing_mode",
         ["circle", "rect", "transform"],
         index=0,
         help="Use transform to move, resize, or delete selected objects.",
     )
-    stroke_width = st.slider("Stroke width", min_value=1, max_value=8, value=3)
-    return label, mode, LABEL_COLORS[label], stroke_width
+    stroke_width = st.sidebar.slider("Stroke width", min_value=1, max_value=8, value=3)
+    return active_label, drawing_mode, LABEL_COLORS[active_label], stroke_width
 
 
-def render_metadata_inputs() -> dict[str, Any]:
-    st.subheader("Image metadata")
+def reset_for_new_image() -> None:
+    st.session_state.canvas_objects = []
+    st.session_state.annotation_table = []
+    st.session_state.restored_annotations_key = None
+    st.session_state.saved_image_key = None
+    st.session_state.image_metadata = default_image_metadata(st.session_state.project_template)
+    st.session_state.region_annotations = default_region_annotations()
 
-    current_metadata = st.session_state.image_metadata
-    objective_magnification = st.selectbox(
-        "objective_magnification",
-        OBJECTIVE_MAGNIFICATIONS,
-        index=OBJECTIVE_MAGNIFICATIONS.index(
-            current_metadata.get("objective_magnification", "unknown")
-            if current_metadata.get("objective_magnification", "unknown") in OBJECTIVE_MAGNIFICATIONS
-            else "unknown"
-        ),
+
+def render_sidebar() -> tuple[Any, Any, str, dict[str, Any], dict[str, Any], str, str, str, int, bool]:
+    st.sidebar.subheader("Upload tissue image")
+    uploaded_image = st.sidebar.file_uploader(
+        "Upload tissue image",
+        type=["jpg", "jpeg", "png", "tif", "tiff"],
     )
-    staining = st.selectbox(
-        "staining",
-        STAINING_OPTIONS,
-        index=STAINING_OPTIONS.index(
-            current_metadata.get("staining", "unknown")
-            if current_metadata.get("staining", "unknown") in STAINING_OPTIONS
-            else "unknown"
-        ),
+    if uploaded_image and st.session_state.image_name != uploaded_image.name:
+        reset_for_new_image()
+
+    project_template = render_project_template()
+    metadata = render_metadata_inputs(project_template)
+    region_annotations = render_region_type()
+    active_label, drawing_mode, stroke_color, stroke_width = render_label_controls()
+
+    st.sidebar.subheader("Export Settings")
+    objective_filter = st.sidebar.selectbox(
+        "objective_magnification filter",
+        ["all", *OBJECTIVE_MAGNIFICATIONS],
+        index=0,
+    )
+    exclude_ignore_from_yolo = st.sidebar.checkbox("Exclude ignore from YOLO export", value=True)
+
+    st.sidebar.subheader("Save / Restore")
+    uploaded_annotations = st.sidebar.file_uploader("Restore annotations.json", type=["json"])
+
+    return (
+        uploaded_image,
+        uploaded_annotations,
+        objective_filter,
+        metadata,
+        region_annotations,
+        active_label,
+        drawing_mode,
+        stroke_color,
+        stroke_width,
+        exclude_ignore_from_yolo,
     )
 
-    metadata = {
-        "objective_magnification": objective_magnification,
-        "staining": staining,
-        "total_magnification": st.text_input(
-            "total_magnification",
-            value=str(current_metadata.get("total_magnification", "")),
-        ),
-        "pixel_size_um": st.text_input(
-            "pixel_size_um",
-            value=str(current_metadata.get("pixel_size_um", "")),
-        ),
-        "tissue_type": st.text_input(
-            "tissue_type",
-            value=str(current_metadata.get("tissue_type", "")),
-        ),
-        "specimen_id": st.text_input(
-            "specimen_id",
-            value=str(current_metadata.get("specimen_id", "")),
-        ),
-        "scanner_or_microscope": st.text_input(
-            "scanner_or_microscope",
-            value=str(current_metadata.get("scanner_or_microscope", "")),
-        ),
-        "annotator": st.text_input(
-            "annotator",
-            value=str(current_metadata.get("annotator", "")),
-        ),
-        "notes": st.text_area(
-            "notes",
-            value=str(current_metadata.get("notes", "")),
-            height=80,
-        ),
-    }
-    st.session_state.image_metadata = metadata
-    return metadata
+
+def render_ecrs_notice(project_template: str) -> None:
+    if project_template == "ECRS_nasal_polyp":
+        st.info(
+            "For research use only. This project supports eosinophil quantification in "
+            "H&E-stained nasal polyp / sinonasal mucosa images. Not intended for clinical diagnosis."
+        )
+
+
+def process_upload(uploaded_image: Any, uploaded_annotations: Any, display_image: Image.Image) -> None:
+    image_key = f"{uploaded_image.name}:{uploaded_image.size}"
+    if st.session_state.saved_image_key != image_key:
+        image_path = save_uploaded_image(uploaded_image)
+        st.session_state.original_image_path = str(image_path)
+        st.session_state.saved_image_key = image_key
+
+    st.session_state.image_name = uploaded_image.name
+    if uploaded_annotations:
+        restore_key = f"{uploaded_image.name}:{uploaded_annotations.name}:{uploaded_annotations.size}"
+        if st.session_state.restored_annotations_key != restore_key:
+            restored, restored_metadata, restored_regions = load_annotation_payload(uploaded_annotations)
+            st.session_state.annotation_table = restored
+            if restored_metadata:
+                st.session_state.image_metadata.update(restored_metadata)
+                template = st.session_state.image_metadata.get("project_template", st.session_state.project_template)
+                if template in PROJECT_TEMPLATES:
+                    st.session_state.project_template = template
+                    st.session_state.last_template = template
+            st.session_state.region_annotations = restored_regions
+            st.session_state.canvas_objects = canvas_json_from_annotations(
+                restored,
+                display_image.size[0],
+                display_image.size[1],
+                st.session_state.scale_factor,
+            )["objects"]
+            st.session_state.restored_annotations_key = restore_key
 
 
 def main() -> None:
@@ -468,170 +963,172 @@ def main() -> None:
     ensure_directories()
     init_session_state()
 
+    (
+        uploaded_image,
+        uploaded_annotations,
+        objective_filter,
+        metadata,
+        region_annotations,
+        active_label,
+        drawing_mode,
+        stroke_color,
+        stroke_width,
+        exclude_ignore_from_yolo,
+    ) = render_sidebar()
+
     st.title(APP_TITLE)
-    st.caption("Research-use manual annotation app for eosinophils, neutrophils, basophils, and other cells.")
+    render_ecrs_notice(metadata.get("project_template", "custom"))
 
-    left, right = st.columns([3, 1], gap="large")
+    if not uploaded_image:
+        st.info("Upload a jpg, png, tif, or tiff image to begin annotation.")
+        return
 
-    with right:
-        st.subheader("Data")
-        uploaded_image = st.file_uploader("Upload tissue image", type=["jpg", "jpeg", "png", "tif", "tiff"])
-        uploaded_annotations = st.file_uploader("Restore annotations.json", type=["json"])
-        if uploaded_image and st.session_state.image_name != uploaded_image.name:
-            st.session_state.canvas_objects = []
-            st.session_state.annotation_table = []
-            st.session_state.restored_annotations_key = None
-            st.session_state.saved_image_key = None
-            st.session_state.image_metadata = default_image_metadata()
+    image = load_image(uploaded_image)
+    display_image, scale_factor = make_display_image(image)
+    st.session_state.image_original_size = image.size
+    st.session_state.display_size = display_image.size
+    st.session_state.scale_factor = scale_factor
+    process_upload(uploaded_image, uploaded_annotations, display_image)
 
-        active_label, drawing_mode, stroke_color, stroke_width = render_controls()
-        metadata = render_metadata_inputs()
+    canvas_width, canvas_height = display_image.size
+    initial_json = {
+        "version": "5.2.4",
+        "objects": st.session_state.canvas_objects,
+        "background": "",
+        "width": canvas_width,
+        "height": canvas_height,
+    }
 
-        count_container = st.container()
-        image_info_container = st.container()
-        action_container = st.container()
+    canvas_result = st_canvas(
+        fill_color="rgba(255, 255, 255, 0)",
+        stroke_width=stroke_width,
+        stroke_color=stroke_color,
+        background_image=display_image,
+        initial_drawing=initial_json,
+        update_streamlit=True,
+        height=canvas_height,
+        width=canvas_width,
+        drawing_mode=drawing_mode,
+        key=f"canvas_{st.session_state.image_name}",
+    )
 
-        if uploaded_image:
-            image = load_image(uploaded_image)
-            display_image, scale_factor = make_display_image(image)
+    if canvas_result.json_data:
+        for obj in canvas_result.json_data.get("objects", []):
+            obj.setdefault("label", active_label)
+            obj.setdefault("created_at", datetime.now().isoformat(timespec="seconds"))
 
-            if st.session_state.image_name != uploaded_image.name:
-                st.session_state.canvas_objects = []
-                st.session_state.annotation_table = []
-                st.session_state.restored_annotations_key = None
-                st.session_state.saved_image_key = None
-                st.session_state.image_metadata = default_image_metadata()
-
-            st.session_state.image_name = uploaded_image.name
-            st.session_state.image_original_size = image.size
-            st.session_state.display_size = display_image.size
-            st.session_state.scale_factor = scale_factor
-
-            image_key = f"{uploaded_image.name}:{uploaded_image.size}"
-            if st.session_state.saved_image_key != image_key:
-                save_uploaded_image(uploaded_image, image)
-                st.session_state.saved_image_key = image_key
-
-            if uploaded_annotations:
-                restore_key = f"{uploaded_image.name}:{uploaded_annotations.name}:{uploaded_annotations.size}"
-            else:
-                restore_key = None
-
-            if uploaded_annotations and st.session_state.restored_annotations_key != restore_key:
-                restored = load_annotation_file(uploaded_annotations)
-                st.session_state.annotation_table = restored
-                restored_metadata = metadata_from_restored_annotations(restored)
-                if restored_metadata:
-                    st.session_state.image_metadata.update(restored_metadata)
-                st.session_state.canvas_objects = canvas_json_from_annotations(
-                    restored,
-                    display_image.size[0],
-                    display_image.size[1],
-                    scale_factor,
-                )["objects"]
-                st.session_state.restored_annotations_key = restore_key
-
-    with left:
-        if not uploaded_image:
-            st.info("Upload a jpg, png, tif, or tiff image to begin annotation.")
-        else:
-            display_image, _ = make_display_image(load_image(uploaded_image))
-            canvas_width, canvas_height = display_image.size
-            initial_json = {
-                "version": "5.2.4",
-                "objects": st.session_state.canvas_objects,
-                "background": "",
-                "width": canvas_width,
-                "height": canvas_height,
-            }
-
-            canvas_result = st_canvas(
-                fill_color="rgba(255, 255, 255, 0)",
-                stroke_width=stroke_width,
-                stroke_color=stroke_color,
-                background_image=display_image,
-                initial_drawing=initial_json,
-                update_streamlit=True,
-                height=canvas_height,
-                width=canvas_width,
-                drawing_mode=drawing_mode,
-                key=f"canvas_{st.session_state.image_name}",
-            )
-
-            if canvas_result.json_data:
-                for obj in canvas_result.json_data.get("objects", []):
-                    obj.setdefault("label", active_label)
-                    obj.setdefault("created_at", datetime.now().isoformat(timespec="seconds"))
-
-                st.session_state.canvas_objects = canvas_result.json_data.get("objects", [])
-                st.session_state.annotation_table = annotations_from_canvas(
-                    canvas_result.json_data,
-                    st.session_state.image_name,
-                    st.session_state.scale_factor,
-                    active_label,
-                )
-
-            st.subheader("Annotations")
-            st.dataframe(pd.DataFrame(st.session_state.annotation_table), hide_index=True, use_container_width=True)
-
-    metadata = st.session_state.image_metadata
-    annotations = apply_metadata_to_annotations(st.session_state.annotation_table, metadata)
-    save_disabled = not st.session_state.image_name
-
-    with count_container:
-        objective_filter = st.selectbox(
-            "Export objective filter",
-            ["all", *OBJECTIVE_MAGNIFICATIONS],
-            index=0,
-            help="Use this to export only 20x or 40x annotations for future model training splits.",
+        st.session_state.canvas_objects = canvas_result.json_data.get("objects", [])
+        st.session_state.annotation_table = annotations_from_canvas(
+            canvas_result.json_data,
+            st.session_state.image_name,
+            st.session_state.scale_factor,
+            active_label,
+            region_annotations.get("global_region_type", "unknown"),
         )
-        export_annotations = filter_annotations_by_objective(annotations, objective_filter)
-        counts_df = count_annotations(export_annotations)
+
+    annotations = apply_context_to_annotations(
+        st.session_state.annotation_table,
+        st.session_state.image_metadata,
+        st.session_state.region_annotations,
+    )
+    export_annotations = filter_annotations_by_objective(annotations, objective_filter)
+    counts_df = count_annotations(
+        export_annotations,
+        st.session_state.image_metadata,
+        st.session_state.image_original_size,
+    )
+
+    metrics = calculate_ecrs_counts(
+        export_annotations,
+        st.session_state.image_metadata,
+        st.session_state.image_original_size,
+    )
+    metric_cols = st.columns(5)
+    metric_cols[0].metric("eosinophil_count", metrics["eosinophil_count"])
+    metric_cols[1].metric("total_annotated_count", metrics["total_annotated_count"])
+    metric_cols[2].metric("eosinophil_ratio", f"{metrics['eosinophil_ratio']:.3f}")
+    metric_cols[3].metric("eos_per_HPF", str(metrics["eos_per_HPF"]))
+    metric_cols[4].metric("eos_per_mm2", str(metrics["eos_per_mm2"]))
+
+    st.caption(
+        f"Original size: {image.size[0]} x {image.size[1]} px | "
+        f"Display scale: {st.session_state.scale_factor:.6f} | "
+        f"Global region_type: {st.session_state.region_annotations.get('global_region_type', 'unknown')}"
+    )
+
+    table_left, table_right = st.columns([2, 1])
+    with table_left:
+        st.subheader("Annotations")
+        st.dataframe(annotations_dataframe(export_annotations), hide_index=True, use_container_width=True)
+    with table_right:
         st.subheader("Counts")
         st.dataframe(counts_df, hide_index=True, use_container_width=True)
 
-    with image_info_container:
-        if st.session_state.image_original_size:
-            original_width, original_height = st.session_state.image_original_size
-            st.metric("Original size", f"{original_width} x {original_height}px")
-            st.metric("Display scale", f"{st.session_state.scale_factor:.4f}")
-
-    with action_container:
-        if st.button("Save JSON / CSV", disabled=save_disabled, use_container_width=True):
-            annotation_path, count_path = save_outputs(
-                st.session_state.image_name,
-                export_annotations,
-                counts_df,
-                metadata,
-                objective_filter,
-            )
-            st.success(f"Saved: {annotation_path} / {count_path}")
-
-        st.download_button(
-            "Download annotations.json",
-            data=json.dumps(
-                {
-                    "image_name": st.session_state.image_name,
-                    "image_metadata": metadata,
-                    "export_objective_filter": objective_filter,
-                    "annotations": export_annotations,
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            file_name="annotations.json",
-            mime="application/json",
-            disabled=save_disabled,
-            use_container_width=True,
+    save_disabled = not st.session_state.image_name
+    if st.button("Save exports", disabled=save_disabled, use_container_width=True):
+        paths = save_outputs(
+            st.session_state.image_name,
+            st.session_state.original_image_path,
+            st.session_state.image_original_size,
+            export_annotations,
+            counts_df,
+            st.session_state.image_metadata,
+            st.session_state.region_annotations,
+            objective_filter,
+            exclude_ignore_from_yolo,
         )
-        st.download_button(
-            "Download counts.csv",
-            data=counts_with_metadata(counts_df, metadata, objective_filter).to_csv(index=False).encode("utf-8-sig"),
-            file_name="counts.csv",
-            mime="text/csv",
-            disabled=save_disabled,
-            use_container_width=True,
-        )
+        st.success("Saved: " + " / ".join(str(path) for path in paths.values()))
+
+    download_payload = {
+        "schema_version": "2.0",
+        "image_name": st.session_state.image_name,
+        "original_image_path": st.session_state.original_image_path,
+        "labels": LABELS,
+        "primary_labels": PRIMARY_LABELS,
+        "yolo_class_ids": YOLO_CLASS_IDS,
+        "image_metadata": st.session_state.image_metadata,
+        "region_annotations": st.session_state.region_annotations,
+        "export_objective_filter": objective_filter,
+        "annotations": export_annotations,
+    }
+    dl_cols = st.columns(4)
+    dl_cols[0].download_button(
+        "Download annotations.json",
+        data=json.dumps(download_payload, ensure_ascii=False, indent=2),
+        file_name="annotations.json",
+        mime="application/json",
+        disabled=save_disabled,
+        use_container_width=True,
+    )
+    dl_cols[1].download_button(
+        "Download annotations.csv",
+        data=annotations_dataframe(export_annotations).to_csv(index=False).encode("utf-8-sig"),
+        file_name="annotations.csv",
+        mime="text/csv",
+        disabled=save_disabled,
+        use_container_width=True,
+    )
+    dl_cols[2].download_button(
+        "Download counts.csv",
+        data=counts_with_metadata(
+            counts_df,
+            st.session_state.image_metadata,
+            st.session_state.region_annotations,
+            objective_filter,
+        ).to_csv(index=False).encode("utf-8-sig"),
+        file_name="counts.csv",
+        mime="text/csv",
+        disabled=save_disabled,
+        use_container_width=True,
+    )
+    dl_cols[3].download_button(
+        "Download YOLO label",
+        data="\n".join(yolo_lines(export_annotations, st.session_state.image_original_size, exclude_ignore_from_yolo)),
+        file_name=f"{Path(st.session_state.image_name).stem}.txt",
+        mime="text/plain",
+        disabled=save_disabled,
+        use_container_width=True,
+    )
 
 
 if __name__ == "__main__":
