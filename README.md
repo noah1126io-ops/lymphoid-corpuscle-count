@@ -1,6 +1,8 @@
 # Manual Granulocyte Annotation Tool
 
-組織画像中の好酸球、好中球、好塩基球、その他の細胞を手動でアノテーションし、教師データとして保存するためのStreamlitアプリです。診断用途ではなく、研究用の教師データ作成を目的としたMVPです。
+ECRS（好酸球性副鼻腔炎）、鼻茸、副鼻腔粘膜などのH&E病理画像から、好酸球を中心に手動アノテーションし、将来的なAI検出モデルの教師データを作成するためのStreamlitアプリです。
+
+本アプリは研究用・定量補助用のMVPです。診断用途ではありません。
 
 ## セットアップ方法
 
@@ -26,100 +28,172 @@ streamlit run app.py
 
 ブラウザで表示されたローカルURLを開きます。
 
+## ECRS / Nasal Polyp Template
+
+`ECRS_nasal_polyp` テンプレートは、H&E染色された鼻茸または副鼻腔粘膜画像における好酸球カウント支援データ作成を想定しています。
+
+このテンプレートでは、初期評価の主対象を `eosinophil` vs `other_cell` / `ignore` としつつ、将来的な拡張のために以下のラベルを保持します。
+
+- `eosinophil`
+- `neutrophil`
+- `basophil`
+- `mast_cell`
+- `lymphocyte`
+- `plasma_cell`
+- `other_cell`
+- `artifact`
+- `ignore`
+
+YOLOクラスIDは次の固定順です。
+
+```text
+0 eosinophil
+1 neutrophil
+2 basophil
+3 mast_cell
+4 lymphocyte
+5 plasma_cell
+6 other_cell
+7 artifact
+8 ignore
+```
+
+YOLO学習用エクスポートでは、`ignore` を除外できます。
+
 ## 使い方
 
-1. 右側の `Upload tissue image` から jpg / png / tif / tiff 画像をアップロードします。
-2. 右側の `Active label` でラベルを選択します。
-3. `Image metadata` に倍率、染色、標本ID、アノテーターなどを入力します。
-4. `Drawing mode` で `circle` または `rect` を選び、画像上の細胞を囲みます。
-5. 既存アノテーションの移動、リサイズ、削除は `transform` モードで行います。
-6. `Export objective filter` で `all`, `20x`, `40x`, `other`, `unknown` から保存対象を選びます。
-7. カウント表でラベル別の件数と合計を確認します。
-8. `Save JSON / CSV` で `data/annotations/` と `data/exports/` に保存します。
-9. 過去のJSONは `Restore annotations.json` から読み込むと復元できます。
+サイドバーは次の順番です。
 
-## 画像メタデータ
+1. `Upload tissue image` から jpg / png / tif / tiff 画像をアップロードします。
+2. `Project Template` で `ECRS_nasal_polyp` などを選びます。
+3. `Image Metadata` に疾患背景、組織種、染色、倍率、標本ID、アノテーターなどを入力します。
+4. `Region Type` で画像全体の領域タイプを選びます。
+5. `Active Label` でラベルを選択します。
+6. `Drawing Mode` で `circle` または `rect` を選び、細胞を囲みます。
+7. `Export Settings` で倍率フィルタやYOLOの `ignore` 除外を設定します。
+8. `Save / Restore` から過去の `annotations.json` を読み込めます。
+9. 画面下部の `Save exports` で各種ファイルを保存します。
+
+## Project Templates
+
+選択できるテンプレート:
+
+- `ECRS_nasal_polyp`
+- `CRS_sinonasal_mucosa`
+- `EoE_esophagus_reference`
+- `GI_eosinophilia_reference`
+- `generic_granulocyte`
+- `custom`
+
+テンプレートを選ぶと、推奨される `disease_context`, `tissue_type`, `staining`, `objective_magnification` などが自動設定されます。
+
+## 保存されるメタデータ
 
 必須項目:
 
-- `objective_magnification`: `20x`, `40x`, `other`, `unknown`
+- `project_template`
+- `disease_context`: `ECRS`, `CRSwNP`, `CRSsNP`, `control`, `unknown`
+- `tissue_type`: `nasal_polyp`, `sinonasal_mucosa`, `inferior_turbinate`, `other`, `unknown`
 - `staining`: `H&E`, `other`, `unknown`
+- `objective_magnification`: `20x`, `40x`, `other`, `unknown`
+- `specimen_id`
+- `slide_id`
+- `annotator`
 
 任意項目:
 
-- `total_magnification`
-- `pixel_size_um`
-- `tissue_type`
-- `specimen_id`
+- `patient_id_hash`
+- `anatomical_site`: `ethmoid_sinus`, `maxillary_sinus`, `nasal_cavity`, `other`, `unknown`
 - `scanner_or_microscope`
-- `annotator`
+- `pixel_size_um`
+- `hpf_area_mm2`
+- `hpf_diameter_mm`
+- `section_quality`: `good`, `acceptable`, `poor`
 - `notes`
 
-入力したメタデータは保存時に各アノテーションへ展開されます。将来的に倍率別、染色別、標本別に学習データを分けるための列として利用できます。
+入力したメタデータは `annotations.json`, `annotations.csv`, `counts.csv`, `dataset_manifest.csv` に保存されます。各アノテーション行にもメタデータが展開されるため、倍率別・疾患背景別・組織種別の再学習や検証に使いやすい形式です。
 
-## 保存されるデータ形式
+## Region Type
 
-アノテーションJSONは次の形式で保存されます。
+初期実装では画像全体の `global_region_type` を保存します。
 
-```json
-{
-  "image_name": "sample.tif",
-  "labels": ["eosinophil", "neutrophil", "basophil", "other"],
-  "label_colors": {
-    "eosinophil": "#e83e8c",
-    "neutrophil": "#2f80ed",
-    "basophil": "#7b2cbf",
-    "other": "#6c757d"
-  },
-  "image_metadata": {
-    "objective_magnification": "20x",
-    "staining": "H&E",
-    "total_magnification": "400x",
-    "pixel_size_um": "0.25",
-    "tissue_type": "lung",
-    "specimen_id": "case_001",
-    "scanner_or_microscope": "scanner A",
-    "annotator": "annotator name",
-    "notes": ""
-  },
-  "export_objective_filter": "20x",
-  "annotations": [
-    {
-      "image_name": "sample.tif",
-      "label": "eosinophil",
-      "x": 120.5,
-      "y": 240.0,
-      "width": 32.0,
-      "height": 32.0,
-      "confidence": 1.0,
-      "objective_magnification": "20x",
-      "staining": "H&E",
-      "total_magnification": "400x",
-      "pixel_size_um": "0.25",
-      "tissue_type": "lung",
-      "specimen_id": "case_001",
-      "scanner_or_microscope": "scanner A",
-      "annotator": "annotator name",
-      "notes": "",
-      "created_at": "2026-05-20T10:00:00"
-    }
-  ],
-  "saved_at": "2026-05-20T10:05:00"
-}
+選択肢:
+
+- `epithelium`
+- `lamina_propria`
+- `glandular_area`
+- `vascular_area`
+- `mucus`
+- `blood_clot`
+- `necrosis`
+- `artifact`
+- `unknown`
+
+保存形式には `region_annotations` を含めています。将来的にポリゴン単位の領域アノテーションを追加できる構造です。
+
+## Count Metrics
+
+ECRSテンプレートでは以下を表示・保存します。
+
+- `eosinophil_count`: 好酸球としてアノテーションされた数
+- `total_annotated_count`: `ignore` を除いた全アノテーション数
+- `eosinophil_ratio`: `eosinophil_count / total_annotated_count`
+- `eos_per_HPF`: `hpf_area_mm2` が入力されている場合のHPF換算値
+- `eos_per_mm2`: `hpf_area_mm2` が入力されている場合の面積あたり換算値
+
+`hpf_area_mm2` が未入力の場合、`eos_per_HPF` と `eos_per_mm2` は `not_calculated` として保存されます。
+
+## Export Files
+
+保存されるファイル:
+
+- `data/annotations/annotations.json`
+- `data/exports/annotations.csv`
+- `data/exports/counts.csv`
+- `data/exports/yolo_labels/<image_stem>.txt`
+- `data/exports/dataset_manifest.csv`
+
+`dataset_manifest.csv` は画像単位の管理表です。
+
+保存項目:
+
+- `image_name`
+- `original_image_path`
+- `project_template`
+- `disease_context`
+- `tissue_type`
+- `staining`
+- `objective_magnification`
+- `pixel_size_um`
+- `hpf_area_mm2`
+- `annotator`
+- `annotation_count`
+- `eosinophil_count`
+- `saved_at`
+
+## Annotation Coordinates
+
+各アノテーションには、hotspot集計やYOLO変換に使える座標を保存します。
+
+- `x_original`
+- `y_original`
+- `bbox_width_original`
+- `bbox_height_original`
+- `x_in_display`
+- `y_in_display`
+- `scale_factor`
+
+後方互換のため、従来の `x`, `y`, `width`, `height` も元画像座標として保持します。
+
+## YOLO変換
+
+YOLO形式は次の形式で保存されます。
+
+```text
+class_id x_center_norm y_center_norm width_norm height_norm
 ```
 
-`x` と `y` は矩形または円の中心座標です。大きい画像は表示用に縮小されますが、保存時には `scale_factor` を使って元画像座標へ戻します。これにより、将来的にYOLO形式へ変換しやすい構造になっています。
-
-カウントCSVは次の形式です。
-
-```csv
-label,count,objective_magnification,staining,total_magnification,pixel_size_um,tissue_type,specimen_id,scanner_or_microscope,annotator,notes,export_objective_filter
-eosinophil,10,20x,H&E,400x,0.25,lung,case_001,scanner A,annotator name,,20x
-neutrophil,8,20x,H&E,400x,0.25,lung,case_001,scanner A,annotator name,,20x
-basophil,2,20x,H&E,400x,0.25,lung,case_001,scanner A,annotator name,,20x
-other,1,20x,H&E,400x,0.25,lung,case_001,scanner A,annotator name,,20x
-total,21,20x,H&E,400x,0.25,lung,case_001,scanner A,annotator name,,20x
-```
+座標は元画像サイズで正規化されます。`ignore` ラベルは、UIのチェックボックスでYOLO出力から除外できます。
 
 ## ディレクトリ構成
 
@@ -132,16 +206,20 @@ total,21,20x,H&E,400x,0.25,lung,case_001,scanner A,annotator name,,20x
     ├── images
     ├── annotations
     └── exports
+        └── yolo_labels
 ```
 
-## YOLO学習データへの変換設計
+## 研究利用と倫理
 
-各アノテーションは `image_name`, `label`, `x`, `y`, `width`, `height` と画像メタデータを元画像座標で保持します。YOLO形式では、画像幅と高さで正規化した中心座標と幅、高さが必要です。この保存形式から次のように直接変換できます。
+このツールは診断用途ではなく、研究用・教師データ作成用です。臨床診断、治療方針決定、病理診断の代替として使用しないでください。
 
-```text
-class_id x_center_norm y_center_norm width_norm height_norm
-```
+公開Web上の病理画像を無断で使用するのではなく、倫理審査・共同研究・データ利用契約などに基づいて取得された匿名化病理画像を使用してください。`patient_id_hash` などの項目は、直接識別子を保存しないための補助項目です。
 
-ラベル順は `eosinophil`, `neutrophil`, `basophil`, `other` として固定しているため、将来的にクラスIDへ安定して変換できます。
+## 今後の拡張予定
 
-`objective_magnification` を使って `20x` と `40x` のデータを分けて保存できるため、倍率別の学習データセットや検証データセットを作成しやすい設計です。
+- AIによる好酸球候補提示
+- hotspot top N 検出
+- 領域ポリゴンごとの `region_type` 管理
+- 病理医確認UI
+- YOLO / COCO / WSIタイル分割エクスポート
+- 倍率別・施設別・標本種別の検証データセット作成
