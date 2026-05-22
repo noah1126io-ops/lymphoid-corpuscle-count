@@ -182,19 +182,34 @@ eos_per_HPF = eos_per_mm2 * hpf_area_mm2
 
 保存されるファイル:
 
-- `data/annotations/<image_stem>_annotations.json`
-- `data/exports/<image_stem>_annotations.csv`
-- `data/exports/<image_stem>_counts.csv`
-- `data/exports/yolo_labels/<image_stem>.txt`
+- `data/annotations/<export_file_stem>_annotations.json`
+- `data/exports/<export_file_stem>_annotations.csv`
+- `data/exports/<export_file_stem>_counts.csv`
+- `data/exports/yolo_labels/<export_file_stem>.txt`
 - `data/exports/dataset_manifest.csv`
 - `data/exports/annotations.csv`
 - `data/exports/counts.csv`
 
-画像ごとのファイルは、別画像を保存しても上書きされません。同じ画像名を再保存した場合は、その画像の annotation JSON/CSV、counts CSV、YOLO label が更新されます。
+`export_file_stem` は原則として次の形式で作られます。
+
+```text
+<specimen_id>_<slide_id>_<image_stem>
+```
+
+`specimen_id` または `slide_id` が未入力の場合は、入力済みのIDと画像名から作られます。両方が未入力の場合は従来通り画像名ベースになります。そのため、別症例で同じ `sample.tif` のような画像名を使う場合は、`specimen_id` と `slide_id` を入力してから保存してください。
+
+画像ごとのファイルは、別画像を保存しても上書きされにくい形式です。同じ `specimen_id`、`slide_id`、画像名の組み合わせを再保存した場合は、その画像の annotation JSON/CSV、counts CSV、YOLO label が更新されます。
 
 `dataset_manifest.csv` は画像単位の管理表です。保存時に `data/annotations/*_annotations.json` を読み直して再生成されるため、複数画像の管理表として使えます。集計用の `annotations.csv` と `counts.csv` も同じタイミングで再生成されます。
 
 `reviewed` と `exported` は、human-confirmed annotation を学習用に使うための管理フラグです。
+
+`dataset_manifest.csv` には、各画像に対応する出力ファイルを追跡しやすいように、次のパス列も保存されます。
+
+- `annotation_json_path`
+- `annotation_csv_path`
+- `count_csv_path`
+- `yolo_label_path`
 
 ## Annotation Coordinates
 
@@ -233,7 +248,9 @@ data/dataset/
 
 初期設定では `reviewed` または `exported` が付いた画像だけを対象にします。これは、完全手動で確認された human-confirmed annotation のみを学習用に使うためです。`ignore` ラベルは `Exclude ignore from YOLO export` により除外できます。
 
-現時点のMVPでは train / val / test の厳密な分割は行わず、同じ `images` ディレクトリを `data.yaml` の train / val / test に指定します。将来的に `dataset_manifest.csv` を使って分割を管理できます。
+現時点のMVPでは train / val / test の厳密な分割は行わず、同じ `images` ディレクトリを `data.yaml` の train / val / test に指定します。これは動作確認用の暫定仕様です。
+
+評価用データセットを作る次段階では、同一患者・同一標本由来の画像がtrainとval/testにまたがらないように、`specimen_id` や `patient_id_hash` 単位で train / val / test を分ける必要があります。将来的には `dataset_manifest.csv` を使って分割を管理します。
 
 ## ディレクトリ構成
 
