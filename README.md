@@ -141,7 +141,15 @@ ECRSテンプレートでは以下を表示・保存します。
 - `eos_per_HPF`: `hpf_area_mm2` が入力されている場合のHPF換算値
 - `eos_per_mm2`: `hpf_area_mm2` が入力されている場合の面積あたり換算値
 
-`hpf_area_mm2` が未入力の場合、`eos_per_HPF` と `eos_per_mm2` は `not_calculated` として保存されます。
+面積換算は `pixel_size_um` が入力され、元画像サイズが取得できる場合のみ行います。
+
+```text
+image_area_mm2 = image_width_px * image_height_px * (pixel_size_um / 1000)^2
+eos_per_mm2 = eosinophil_count / image_area_mm2
+eos_per_HPF = eos_per_mm2 * hpf_area_mm2
+```
+
+`pixel_size_um` が未入力の場合、`eos_per_mm2` と `eos_per_HPF` は `not_calculated` として保存されます。ただし、画像全体がちょうど1 HPFであることを `Image is exactly 1 HPF` で明示した場合のみ、`eos_per_HPF = eosinophil_count` として保存できます。
 
 ## Export Files
 
@@ -159,6 +167,8 @@ ECRSテンプレートでは以下を表示・保存します。
 
 `dataset_manifest.csv` は画像単位の管理表です。保存時に `data/annotations/*_annotations.json` を読み直して再生成されるため、複数画像の管理表として使えます。集約版の `annotations.csv` と `counts.csv` も同じタイミングで再生成されます。
 
+`reviewed` と `exported` は、human-confirmed annotation を学習用に使うための管理フラグです。MVPでは保存前に必須メタデータが空の場合でも保存は可能ですが、警告が表示されます。
+
 保存項目:
 
 - `image_name`
@@ -171,6 +181,8 @@ ECRSテンプレートでは以下を表示・保存します。
 - `pixel_size_um`
 - `hpf_area_mm2`
 - `annotator`
+- `reviewed`
+- `exported`
 - `annotation_count`
 - `eosinophil_count`
 - `saved_at`
@@ -199,6 +211,21 @@ class_id x_center_norm y_center_norm width_norm height_norm
 
 座標は元画像サイズで正規化されます。`ignore` ラベルは、UIのチェックボックスでYOLO出力から除外できます。
 
+## YOLO学習用エクスポート
+
+`Generate YOLO training dataset` を押すと、保存済みの画像別 annotation JSON からYOLO学習用ディレクトリを生成します。
+
+```text
+data/dataset/
+├── images/
+├── labels/
+└── data.yaml
+```
+
+初期設定では `reviewed` または `exported` が付いた画像だけを対象にします。これは、完全手動で確認された human-confirmed annotation のみを学習用に使うためです。`ignore` ラベルは `Exclude ignore from YOLO export` により除外できます。
+
+現時点のMVPでは train / val / test の厳密な分割は行わず、同じ `images` ディレクトリを `data.yaml` の train / val / test に指定します。将来的に `dataset_manifest.csv` を使って分割を管理できます。
+
 ## ディレクトリ構成
 
 ```text
@@ -209,6 +236,9 @@ class_id x_center_norm y_center_norm width_norm height_norm
 └── data
     ├── images
     ├── annotations
+    ├── dataset
+    │   ├── images
+    │   └── labels
     └── exports
         └── yolo_labels
 ```
