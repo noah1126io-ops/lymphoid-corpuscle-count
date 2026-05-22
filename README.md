@@ -111,7 +111,7 @@ YOLO学習用エクスポートでは、`ignore` を除外できます。
 - `section_quality`: `good`, `acceptable`, `poor`
 - `notes`
 
-入力したメタデータは `annotations.json`, `annotations.csv`, `counts.csv`, `dataset_manifest.csv` に保存されます。各アノテーション行にもメタデータが展開されるため、倍率別・疾患背景別・組織種別の再学習や検証に使いやすい形式です。
+入力したメタデータは画像ごとの annotation JSON/CSV、counts CSV、集約用の `dataset_manifest.csv` に保存されます。各アノテーション行にもメタデータが展開されるため、倍率別・疾患背景別・組織種別の再学習や検証に使いやすい形式です。
 
 ## Region Type
 
@@ -147,13 +147,17 @@ ECRSテンプレートでは以下を表示・保存します。
 
 保存されるファイル:
 
-- `data/annotations/annotations.json`
-- `data/exports/annotations.csv`
-- `data/exports/counts.csv`
+- `data/annotations/<image_stem>_annotations.json`
+- `data/exports/<image_stem>_annotations.csv`
+- `data/exports/<image_stem>_counts.csv`
 - `data/exports/yolo_labels/<image_stem>.txt`
 - `data/exports/dataset_manifest.csv`
+- `data/exports/annotations.csv`
+- `data/exports/counts.csv`
 
-`dataset_manifest.csv` は画像単位の管理表です。
+画像ごとのファイルは、別画像を保存しても上書きされません。同じ画像名を再保存した場合は、その画像の annotation JSON/CSV、counts CSV、YOLO label が更新されます。
+
+`dataset_manifest.csv` は画像単位の管理表です。保存時に `data/annotations/*_annotations.json` を読み直して再生成されるため、複数画像の管理表として使えます。集約版の `annotations.csv` と `counts.csv` も同じタイミングで再生成されます。
 
 保存項目:
 
