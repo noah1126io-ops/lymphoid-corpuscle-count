@@ -8,8 +8,14 @@ data/images/*
 data/annotations/*
 data/exports/*
 data/exports/yolo_labels/*
+data/dataset/*
 !data/images/.gitkeep
 !data/annotations/.gitkeep
 !data/exports/.gitkeep
 !data/exports/yolo_labels/
 !data/exports/yolo_labels/.gitkeep
+!data/dataset/
+!data/dataset/images/
+!data/dataset/labels/
+!data/dataset/images/.gitkeep
+!data/dataset/labels/.gitkeep
