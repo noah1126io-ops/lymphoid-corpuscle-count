@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -106,7 +107,10 @@ METADATA_FIELDS = [
     "pixel_size_um",
     "hpf_area_mm2",
     "hpf_diameter_mm",
+    "image_is_single_hpf",
     "section_quality",
+    "reviewed",
+    "exported",
     "notes",
 ]
 MANIFEST_FIELDS = [
@@ -120,9 +124,21 @@ MANIFEST_FIELDS = [
     "pixel_size_um",
     "hpf_area_mm2",
     "annotator",
+    "reviewed",
+    "exported",
     "annotation_count",
     "eosinophil_count",
     "saved_at",
+]
+REQUIRED_METADATA_FIELDS = [
+    "project_template",
+    "disease_context",
+    "tissue_type",
+    "staining",
+    "objective_magnification",
+    "specimen_id",
+    "slide_id",
+    "annotator",
 ]
 TEMPLATE_DEFAULTS = {
     "ECRS_nasal_polyp": {
@@ -186,6 +202,9 @@ IMAGE_DIR = DATA_DIR / "images"
 ANNOTATION_DIR = DATA_DIR / "annotations"
 EXPORT_DIR = DATA_DIR / "exports"
 YOLO_DIR = EXPORT_DIR / "yolo_labels"
+DATASET_DIR = DATA_DIR / "dataset"
+DATASET_IMAGE_DIR = DATASET_DIR / "images"
+DATASET_LABEL_DIR = DATASET_DIR / "labels"
 MAX_DISPLAY_WIDTH = 1100
 MAX_DISPLAY_HEIGHT = 900
 
@@ -248,7 +267,7 @@ def disable_canvas_context_menu() -> None:
 
 
 def ensure_directories() -> None:
-    for path in (IMAGE_DIR, ANNOTATION_DIR, EXPORT_DIR, YOLO_DIR):
+    for path in (IMAGE_DIR, ANNOTATION_DIR, EXPORT_DIR, YOLO_DIR, DATASET_IMAGE_DIR, DATASET_LABEL_DIR):
         path.mkdir(parents=True, exist_ok=True)
 
 
@@ -268,7 +287,10 @@ def default_image_metadata(project_template: str = "ECRS_nasal_polyp") -> dict[s
         "pixel_size_um": "",
         "hpf_area_mm2": "",
         "hpf_diameter_mm": "",
+        "image_is_single_hpf": False,
         "section_quality": "good",
+        "reviewed": False,
+        "exported": False,
         "notes": "",
     }
     metadata.update(TEMPLATE_DEFAULTS.get(project_template, TEMPLATE_DEFAULTS["custom"]))
@@ -294,6 +316,7 @@ def init_session_state() -> None:
         "restored_annotations_key": None,
         "annotation_table": [],
         "canvas_key_version": 0,
+        "canvas_initial_drawing_pending": True,
         "last_saved_message": "",
         "project_template": "ECRS_nasal_polyp",
         "image_metadata": default_image_metadata("ECRS_nasal_polyp"),
@@ -550,13 +573,18 @@ def calculate_ecrs_counts(
     ratio = eos_count / total_count if total_count else 0.0
     hpf_area = safe_float(metadata.get("hpf_area_mm2"))
     image_area = image_area_mm2_from_pixel_size(image_size, metadata.get("pixel_size_um"))
-    area_for_density = hpf_area or image_area
-    eos_per_mm2 = round(eos_count / area_for_density, 6) if area_for_density and area_for_density > 0 else "not_calculated"
-    eos_per_hpf = (
-        round(eos_per_mm2 * hpf_area, 6)
-        if isinstance(eos_per_mm2, float) and hpf_area and hpf_area > 0
-        else "not_calculated"
-    )
+    is_single_hpf = bool(metadata.get("image_is_single_hpf"))
+
+    if image_area and image_area > 0:
+        eos_per_mm2 = round(eos_count / image_area, 6)
+        eos_per_hpf = (
+            round(eos_per_mm2 * hpf_area, 6)
+            if hpf_area and hpf_area > 0
+            else "not_calculated"
+        )
+    else:
+        eos_per_mm2 = "not_calculated"
+        eos_per_hpf = eos_count if is_single_hpf else "not_calculated"
 
     return {
         "eosinophil_count": eos_count,
@@ -610,8 +638,9 @@ def dataset_manifest_row(
     metadata: dict[str, Any],
     annotations: list[dict[str, Any]],
     saved_at: str,
+    image_size: tuple[int, int] | None = None,
 ) -> dict[str, Any]:
-    ecrs_counts = calculate_ecrs_counts(annotations, metadata)
+    ecrs_counts = calculate_ecrs_counts(annotations, metadata, image_size)
     return {
         "image_name": image_name,
         "original_image_path": original_image_path,
@@ -623,6 +652,8 @@ def dataset_manifest_row(
         "pixel_size_um": metadata.get("pixel_size_um", ""),
         "hpf_area_mm2": metadata.get("hpf_area_mm2", ""),
         "annotator": metadata.get("annotator", ""),
+        "reviewed": bool(metadata.get("reviewed", False)),
+        "exported": bool(metadata.get("exported", False)),
         "annotation_count": len(annotations),
         "eosinophil_count": ecrs_counts["eosinophil_count"],
         "saved_at": saved_at,
@@ -667,6 +698,181 @@ def yolo_lines(
     return lines
 
 
+def write_data_yaml() -> Path:
+    DATASET_DIR.mkdir(parents=True, exist_ok=True)
+    class_names = [label for label, _ in sorted(YOLO_CLASS_IDS.items(), key=lambda item: item[1])]
+    yaml_path = DATASET_DIR / "data.yaml"
+    yaml_lines = [
+        f"path: {DATASET_DIR.as_posix()}",
+        "train: images",
+        "val: images",
+        "test: images",
+        f"nc: {len(class_names)}",
+        "names:",
+    ]
+    yaml_lines.extend(f"  {index}: {name}" for index, name in enumerate(class_names))
+    yaml_path.write_text("\n".join(yaml_lines) + "\n", encoding="utf-8")
+    return yaml_path
+
+
+def source_image_path(payload: dict[str, Any]) -> Path | None:
+    candidates = [
+        Path(str(payload.get("original_image_path", ""))),
+        IMAGE_DIR / str(payload.get("image_name", "")),
+    ]
+    for candidate in candidates:
+        if candidate and candidate.exists() and candidate.is_file():
+            return candidate
+    return None
+
+
+def generate_yolo_training_dataset(
+    only_reviewed_or_exported: bool,
+    exclude_ignore: bool,
+) -> dict[str, Any]:
+    ensure_directories()
+    exported_images = 0
+    exported_labels = 0
+    skipped_images = []
+
+    for payload in saved_annotation_payloads():
+        metadata = payload.get("image_metadata", {})
+        if only_reviewed_or_exported and not (metadata.get("reviewed") or metadata.get("exported")):
+            skipped_images.append(payload.get("image_name", "unknown"))
+            continue
+
+        image_name = payload.get("image_name", "")
+        image_size = image_size_from_payload(payload)
+        image_source = source_image_path(payload)
+        if not image_name or image_size is None or image_source is None:
+            skipped_images.append(image_name or "unknown")
+            continue
+
+        stem = safe_file_stem(image_name)
+        image_destination = DATASET_IMAGE_DIR / image_source.name
+        label_destination = DATASET_LABEL_DIR / f"{stem}.txt"
+
+        shutil.copy2(image_source, image_destination)
+        label_destination.write_text(
+            "\n".join(yolo_lines(payload.get("annotations", []), image_size, exclude_ignore)),
+            encoding="utf-8",
+        )
+        exported_images += 1
+        exported_labels += 1
+
+    yaml_path = write_data_yaml()
+    return {
+        "images": exported_images,
+        "labels": exported_labels,
+        "skipped": skipped_images,
+        "data_yaml": yaml_path,
+    }
+
+
+def safe_file_stem(image_name: str) -> str:
+    stem = Path(image_name).stem
+    safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem).strip("._")
+    return safe_stem or "image"
+
+
+def image_export_paths(image_name: str) -> dict[str, Path]:
+    stem = safe_file_stem(image_name)
+    return {
+        "annotations_json": ANNOTATION_DIR / f"{stem}_annotations.json",
+        "annotations_csv": EXPORT_DIR / f"{stem}_annotations.csv",
+        "counts_csv": EXPORT_DIR / f"{stem}_counts.csv",
+        "yolo_labels": YOLO_DIR / f"{stem}.txt",
+    }
+
+
+def load_saved_annotation_payload(path: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if isinstance(payload, dict) and isinstance(payload.get("annotations", []), list):
+        return payload
+    return None
+
+
+def saved_annotation_payloads() -> list[dict[str, Any]]:
+    payloads = []
+    for path in sorted(ANNOTATION_DIR.glob("*_annotations.json")):
+        payload = load_saved_annotation_payload(path)
+        if payload:
+            payloads.append(payload)
+    return payloads
+
+
+def image_size_from_payload(payload: dict[str, Any]) -> tuple[int, int] | None:
+    image_size = payload.get("image_size")
+    if not isinstance(image_size, dict):
+        return None
+    width = safe_float(image_size.get("width"))
+    height = safe_float(image_size.get("height"))
+    if not width or not height:
+        return None
+    return int(width), int(height)
+
+
+def regenerate_dataset_exports() -> None:
+    payloads = saved_annotation_payloads()
+    manifest_rows = []
+    annotation_rows = []
+    count_frames = []
+
+    for payload in payloads:
+        image_name = payload.get("image_name", "")
+        original_image_path = payload.get("original_image_path", "")
+        metadata = payload.get("image_metadata", {})
+        region_annotations = payload.get("region_annotations", default_region_annotations())
+        annotations = payload.get("annotations", [])
+        saved_at = payload.get("saved_at", "")
+        image_size = image_size_from_payload(payload)
+
+        manifest_rows.append(
+            dataset_manifest_row(
+                image_name,
+                original_image_path,
+                metadata,
+                annotations,
+                saved_at,
+                image_size,
+            )
+        )
+        annotation_rows.extend(annotations)
+
+        counts_df = count_annotations(annotations, metadata, image_size)
+        counts_context = counts_with_metadata(
+            counts_df,
+            metadata,
+            region_annotations,
+            payload.get("export_objective_filter", "all"),
+        )
+        counts_context.insert(0, "image_name", image_name)
+        counts_context["saved_at"] = saved_at
+        count_frames.append(counts_context)
+
+    pd.DataFrame(manifest_rows, columns=MANIFEST_FIELDS).to_csv(
+        EXPORT_DIR / "dataset_manifest.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    annotations_dataframe(annotation_rows).to_csv(
+        EXPORT_DIR / "annotations.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    if count_frames:
+        pd.concat(count_frames, ignore_index=True).to_csv(
+            EXPORT_DIR / "counts.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+    else:
+        pd.DataFrame().to_csv(EXPORT_DIR / "counts.csv", index=False, encoding="utf-8-sig")
+
+
 def save_outputs(
     image_name: str,
     original_image_path: str,
@@ -679,11 +885,10 @@ def save_outputs(
     exclude_ignore_from_yolo: bool,
 ) -> dict[str, Path]:
     saved_at = datetime.now().isoformat(timespec="seconds")
-    annotation_path = ANNOTATION_DIR / "annotations.json"
-    annotation_csv_path = EXPORT_DIR / "annotations.csv"
-    count_path = EXPORT_DIR / "counts.csv"
+    paths = image_export_paths(image_name)
     manifest_path = EXPORT_DIR / "dataset_manifest.csv"
-    yolo_path = YOLO_DIR / f"{Path(image_name).stem}.txt"
+    aggregate_annotations_path = EXPORT_DIR / "annotations.csv"
+    aggregate_counts_path = EXPORT_DIR / "counts.csv"
 
     payload = {
         "schema_version": "2.0",
@@ -693,34 +898,44 @@ def save_outputs(
         "primary_labels": PRIMARY_LABELS,
         "label_colors": LABEL_COLORS,
         "yolo_class_ids": YOLO_CLASS_IDS,
+        "image_size": {
+            "width": image_size[0] if image_size else None,
+            "height": image_size[1] if image_size else None,
+        },
         "image_metadata": metadata,
         "region_annotations": region_annotations,
         "export_objective_filter": objective_filter,
         "annotations": annotations,
         "saved_at": saved_at,
     }
-    annotation_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    annotations_dataframe(annotations).to_csv(annotation_csv_path, index=False, encoding="utf-8-sig")
-    counts_with_metadata(counts_df, metadata, region_annotations, objective_filter).to_csv(
-        count_path,
+    paths["annotations_json"].write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    annotations_dataframe(annotations).to_csv(
+        paths["annotations_csv"],
         index=False,
         encoding="utf-8-sig",
     )
-    pd.DataFrame(
-        [dataset_manifest_row(image_name, original_image_path, metadata, annotations, saved_at)],
-        columns=MANIFEST_FIELDS,
-    ).to_csv(manifest_path, index=False, encoding="utf-8-sig")
-    yolo_path.write_text(
+    counts_with_metadata(counts_df, metadata, region_annotations, objective_filter).to_csv(
+        paths["counts_csv"],
+        index=False,
+        encoding="utf-8-sig",
+    )
+    paths["yolo_labels"].write_text(
         "\n".join(yolo_lines(annotations, image_size, exclude_ignore_from_yolo)),
         encoding="utf-8",
     )
+    regenerate_dataset_exports()
 
     return {
-        "annotations_json": annotation_path,
-        "annotations_csv": annotation_csv_path,
-        "counts_csv": count_path,
+        "annotations_json": paths["annotations_json"],
+        "annotations_csv": paths["annotations_csv"],
+        "counts_csv": paths["counts_csv"],
+        "aggregate_annotations_csv": aggregate_annotations_path,
+        "aggregate_counts_csv": aggregate_counts_path,
         "dataset_manifest_csv": manifest_path,
-        "yolo_labels": yolo_path,
+        "yolo_labels": paths["yolo_labels"],
     }
 
 
@@ -749,6 +964,15 @@ def metadata_from_restored_annotations(annotations: list[dict[str, Any]]) -> dic
 def select_index(options: list[str], value: Any, fallback: str) -> int:
     value = value if value in options else fallback
     return options.index(value)
+
+
+def missing_required_metadata(metadata: dict[str, Any]) -> list[str]:
+    missing = []
+    for field in REQUIRED_METADATA_FIELDS:
+        value = metadata.get(field)
+        if value is None or str(value).strip() == "":
+            missing.append(field)
+    return missing
 
 
 def render_project_template() -> str:
@@ -821,10 +1045,25 @@ def render_metadata_inputs(project_template: str) -> dict[str, Any]:
             "hpf_diameter_mm",
             value=str(current.get("hpf_diameter_mm", "")),
         ),
+        "image_is_single_hpf": st.sidebar.checkbox(
+            "Image is exactly 1 HPF",
+            value=bool(current.get("image_is_single_hpf", False)),
+            help="Use only when the whole image represents exactly one high-power field.",
+        ),
         "section_quality": st.sidebar.selectbox(
             "section_quality",
             SECTION_QUALITY_OPTIONS,
             index=select_index(SECTION_QUALITY_OPTIONS, current.get("section_quality"), "good"),
+        ),
+        "reviewed": st.sidebar.checkbox(
+            "reviewed",
+            value=bool(current.get("reviewed", False)),
+            help="Mark this image as human-confirmed for training export.",
+        ),
+        "exported": st.sidebar.checkbox(
+            "exported",
+            value=bool(current.get("exported", False)),
+            help="Mark this image as eligible for dataset export.",
         ),
         "notes": st.sidebar.text_area("notes", value=str(current.get("notes", "")), height=80),
     }
@@ -881,9 +1120,10 @@ def reset_for_new_image() -> None:
     st.session_state.image_metadata = default_image_metadata(st.session_state.project_template)
     st.session_state.region_annotations = default_region_annotations()
     st.session_state.canvas_key_version += 1
+    st.session_state.canvas_initial_drawing_pending = True
 
 
-def render_sidebar() -> tuple[Any, Any, str, dict[str, Any], dict[str, Any], str, str, str, int, bool]:
+def render_sidebar() -> tuple[Any, Any, str, dict[str, Any], dict[str, Any], str, str, str, int, bool, bool]:
     st.sidebar.subheader("Upload tissue image")
     uploaded_image = st.sidebar.file_uploader(
         "Upload tissue image",
@@ -904,6 +1144,11 @@ def render_sidebar() -> tuple[Any, Any, str, dict[str, Any], dict[str, Any], str
         index=0,
     )
     exclude_ignore_from_yolo = st.sidebar.checkbox("Exclude ignore from YOLO export", value=True)
+    only_reviewed_or_exported = st.sidebar.checkbox(
+        "YOLO dataset: reviewed/exported only",
+        value=True,
+        help="Use only human-confirmed or explicitly exported images for the training dataset.",
+    )
 
     st.sidebar.subheader("Save / Restore")
     uploaded_annotations = st.sidebar.file_uploader("Restore annotations.json", type=["json"])
@@ -919,6 +1164,7 @@ def render_sidebar() -> tuple[Any, Any, str, dict[str, Any], dict[str, Any], str
         stroke_color,
         stroke_width,
         exclude_ignore_from_yolo,
+        only_reviewed_or_exported,
     )
 
 
@@ -958,6 +1204,7 @@ def process_upload(uploaded_image: Any, uploaded_annotations: Any, display_image
             )["objects"]
             st.session_state.restored_annotations_key = restore_key
             st.session_state.canvas_key_version += 1
+            st.session_state.canvas_initial_drawing_pending = True
 
 
 def main() -> None:
@@ -978,6 +1225,7 @@ def main() -> None:
         stroke_color,
         stroke_width,
         exclude_ignore_from_yolo,
+        only_reviewed_or_exported,
     ) = render_sidebar()
 
     st.title(APP_TITLE)
@@ -995,17 +1243,19 @@ def main() -> None:
     process_upload(uploaded_image, uploaded_annotations, display_image)
 
     canvas_width, canvas_height = display_image.size
-    initial_json = {
-        "version": "5.2.4",
-        "objects": st.session_state.canvas_objects,
-        "background": "",
-        "width": canvas_width,
-        "height": canvas_height,
-    }
+    initial_json = None
+    if st.session_state.canvas_initial_drawing_pending:
+        initial_json = {
+            "version": "5.2.4",
+            "objects": st.session_state.canvas_objects,
+            "background": "",
+            "width": canvas_width,
+            "height": canvas_height,
+        }
+        st.session_state.canvas_initial_drawing_pending = False
 
     st.caption(
-        "Draw one or more annotations, then click the leftmost toolbar icon on the canvas "
-        "to sync counts and exports. Saving will refresh the canvas safely before more drawing."
+        "Draw annotations directly on the image. Counts and exports update after each completed shape."
     )
     canvas_result = st_canvas(
         fill_color="rgba(255, 255, 255, 0)",
@@ -1013,7 +1263,7 @@ def main() -> None:
         stroke_color=stroke_color,
         background_image=display_image,
         initial_drawing=initial_json,
-        update_streamlit=False,
+        update_streamlit=True,
         height=canvas_height,
         width=canvas_width,
         drawing_mode=drawing_mode,
@@ -1077,8 +1327,17 @@ def main() -> None:
         st.success(st.session_state.last_saved_message)
         st.session_state.last_saved_message = ""
 
+    missing_metadata = missing_required_metadata(st.session_state.image_metadata)
+    if missing_metadata:
+        st.warning(
+            "Missing required metadata: "
+            + ", ".join(missing_metadata)
+            + ". Saving is still allowed for this MVP."
+        )
+
     if st.button("Refresh canvas", disabled=save_disabled, use_container_width=True):
         st.session_state.canvas_key_version += 1
+        st.session_state.canvas_initial_drawing_pending = True
         st.rerun()
 
     if st.button("Save exports", disabled=save_disabled, use_container_width=True):
@@ -1094,8 +1353,20 @@ def main() -> None:
             exclude_ignore_from_yolo,
         )
         st.session_state.last_saved_message = "Saved: " + " / ".join(str(path) for path in paths.values())
-        st.session_state.canvas_key_version += 1
         st.rerun()
+
+    if st.button("Generate YOLO training dataset", use_container_width=True):
+        dataset_result = generate_yolo_training_dataset(
+            only_reviewed_or_exported=only_reviewed_or_exported,
+            exclude_ignore=exclude_ignore_from_yolo,
+        )
+        st.success(
+            "YOLO dataset generated: "
+            f"{dataset_result['images']} images, {dataset_result['labels']} label files, "
+            f"data.yaml at {dataset_result['data_yaml']}"
+        )
+        if dataset_result["skipped"]:
+            st.warning("Skipped images: " + ", ".join(dataset_result["skipped"]))
 
     download_payload = {
         "schema_version": "2.0",
