@@ -1,6 +1,6 @@
 # Manual Granulocyte Annotation Tool
 
-ECRS（好酸球性副鼻腔炎）、鼻茸、副鼻腔粘膜などのH&E病理画像から、好酸球を中心に手動アノテーションし、将来的なAI検出モデルの教師データを作成するためのStreamlitアプリです。
+ECRS、鼻茸、副鼻腔粘膜などのH&E病理画像から、好酸球を中心に手動アノテーションし、将来的なAI検出モデルの教師データを作成するためのStreamlitアプリです。
 
 本アプリは研究用・定量補助用のMVPです。診断用途ではありません。
 
@@ -32,7 +32,7 @@ streamlit run app.py
 
 `ECRS_nasal_polyp` テンプレートは、H&E染色された鼻茸または副鼻腔粘膜画像における好酸球カウント支援データ作成を想定しています。
 
-このテンプレートでは、初期評価の主対象を `eosinophil` vs `other_cell` / `ignore` としつつ、将来的な拡張のために以下のラベルを保持します。
+初期評価の主対象は `eosinophil` vs `other_cell` / `ignore` です。将来的な拡張のため、次のラベルも保持します。
 
 - `eosinophil`
 - `neutrophil`
@@ -62,8 +62,6 @@ YOLO学習用エクスポートでは、`ignore` を除外できます。
 
 ## 使い方
 
-サイドバーは次の順番です。
-
 1. `Upload tissue image` から jpg / png / tif / tiff 画像をアップロードします。
 2. `Project Template` で `ECRS_nasal_polyp` などを選びます。
 3. `Image Metadata` に疾患背景、組織種、染色、倍率、標本ID、アノテーターなどを入力します。
@@ -89,13 +87,15 @@ YOLO学習用エクスポートでは、`ignore` を除外できます。
 
 ## 保存されるメタデータ
 
+メタデータは画像単位の情報として入力します。保存時には、各アノテーション行、画像ごとのcountファイル、集計用の `dataset_manifest.csv` に展開されます。
+
 必須項目:
 
 - `project_template`
-- `disease_context`: `ECRS`, `CRSwNP`, `CRSsNP`, `control`, `unknown`
-- `tissue_type`: `nasal_polyp`, `sinonasal_mucosa`, `inferior_turbinate`, `other`, `unknown`
-- `staining`: `H&E`, `other`, `unknown`
-- `objective_magnification`: `20x`, `40x`, `other`, `unknown`
+- `disease_context`
+- `tissue_type`
+- `staining`
+- `objective_magnification`
 - `specimen_id`
 - `slide_id`
 - `annotator`
@@ -103,15 +103,42 @@ YOLO学習用エクスポートでは、`ignore` を除外できます。
 任意項目:
 
 - `patient_id_hash`
-- `anatomical_site`: `ethmoid_sinus`, `maxillary_sinus`, `nasal_cavity`, `other`, `unknown`
+- `anatomical_site`
 - `scanner_or_microscope`
 - `pixel_size_um`
 - `hpf_area_mm2`
 - `hpf_diameter_mm`
-- `section_quality`: `good`, `acceptable`, `poor`
+- `image_is_single_hpf`
+- `section_quality`
+- `reviewed`
+- `exported`
 - `notes`
 
-入力したメタデータは画像ごとの annotation JSON/CSV、counts CSV、集約用の `dataset_manifest.csv` に保存されます。各アノテーション行にもメタデータが展開されるため、倍率別・疾患背景別・組織種別の再学習や検証に使いやすい形式です。
+MVPでは必須項目が空でも保存できますが、保存前にwarningを表示します。
+
+## メタデータ項目の説明
+
+| 項目 | 必須 | 説明 |
+|---|---:|---|
+| `project_template` | はい | 解析目的や対象組織に応じたテンプレートです。ECRS鼻茸、CRS副鼻腔粘膜、EoE参照、GI好酸球症参照、汎用顆粒球、カスタムを区別します。テンプレート別に推奨ラベルや初期メタデータを変えるために使います。 |
+| `disease_context` | はい | 画像が属する疾患・臨床研究上の背景です。例: `ECRS`, `CRSwNP`, `CRSsNP`, `control`, `unknown`。疾患群別の集計や学習データ分割に使います。 |
+| `tissue_type` | はい | 標本の組織種です。例: `nasal_polyp`, `sinonasal_mucosa`, `inferior_turbinate`, `other`, `unknown`。組織ごとの好酸球分布やモデル性能を比較するために使います。 |
+| `staining` | はい | 染色法です。初期想定は `H&E` です。染色条件が異なる画像を混ぜて学習・評価しないための管理項目です。 |
+| `objective_magnification` | はい | 対物レンズ倍率です。例: `20x`, `40x`, `other`, `unknown`。倍率別にデータを分ける、またはYOLO学習用にフィルタするために使います。 |
+| `specimen_id` | はい | 標本単位の匿名化IDです。患者氏名やカルテ番号などの直接識別子は入れず、研究内で追跡可能なIDを使います。 |
+| `slide_id` | はい | スライド単位の匿名化IDです。同一標本から複数スライドがある場合に区別します。 |
+| `annotator` | はい | アノテーション実施者のIDまたは名前です。複数アノテーター間の一致率確認やレビュー管理に使います。 |
+| `patient_id_hash` | いいえ | 患者単位で画像をまとめるための匿名化・ハッシュ化IDです。直接識別子は保存しないでください。患者単位でtrain/val/testを分ける場合に有用です。 |
+| `anatomical_site` | いいえ | 採取部位です。例: `ethmoid_sinus`, `maxillary_sinus`, `nasal_cavity`, `other`, `unknown`。部位別の炎症分布やモデル評価に使います。 |
+| `scanner_or_microscope` | いいえ | 画像取得に使ったスキャナー、顕微鏡、カメラなどの情報です。施設差・機器差による色調や解像度の違いを確認するために使います。 |
+| `pixel_size_um` | いいえ | 1ピクセルあたりの実寸をマイクロメートル単位で入力します。`eos/mm²` の計算に必要です。未入力の場合、面積換算はできません。 |
+| `hpf_area_mm2` | いいえ | 1 high-power fieldの面積をmm²単位で入力します。`eos/HPF` を `eos/mm² * hpf_area_mm2` として換算するために使います。顕微鏡・接眼レンズ条件により異なります。 |
+| `hpf_diameter_mm` | いいえ | HPFの視野直径をmm単位で記録する項目です。現時点では主に記録用で、必要に応じて `hpf_area_mm2` の確認に使えます。 |
+| `image_is_single_hpf` | いいえ | 画像全体がちょうど1 HPFであることを明示するチェックです。`pixel_size_um` がない場合でも、このチェックがある場合のみ `eos_per_HPF = eosinophil_count` として保存できます。 |
+| `section_quality` | いいえ | 切片・画像品質です。例: `good`, `acceptable`, `poor`。ぼけ、折れ、染色不良、圧挫などがある画像を後で除外・層別化するために使います。 |
+| `reviewed` | いいえ | 人が確認済みで学習候補にできる画像であることを示す管理フラグです。YOLO学習用エクスポートで対象画像を絞るために使います。 |
+| `exported` | いいえ | 学習用・共有用などにエクスポート済みであることを示す管理フラグです。再エクスポートやデータセット管理に使います。 |
+| `notes` | いいえ | 自由記載欄です。染色の癖、アーチファクト、判定に迷った点、共同研究上の補足などを記録できます。 |
 
 ## Region Type
 
@@ -138,8 +165,8 @@ ECRSテンプレートでは以下を表示・保存します。
 - `eosinophil_count`: 好酸球としてアノテーションされた数
 - `total_annotated_count`: `ignore` を除いた全アノテーション数
 - `eosinophil_ratio`: `eosinophil_count / total_annotated_count`
-- `eos_per_HPF`: `hpf_area_mm2` が入力されている場合のHPF換算値
-- `eos_per_mm2`: `hpf_area_mm2` が入力されている場合の面積あたり換算値
+- `eos_per_HPF`: HPFあたりの推定好酸球数
+- `eos_per_mm2`: 1 mm²あたりの推定好酸球数
 
 面積換算は `pixel_size_um` が入力され、元画像サイズが取得できる場合のみ行います。
 
@@ -165,27 +192,9 @@ eos_per_HPF = eos_per_mm2 * hpf_area_mm2
 
 画像ごとのファイルは、別画像を保存しても上書きされません。同じ画像名を再保存した場合は、その画像の annotation JSON/CSV、counts CSV、YOLO label が更新されます。
 
-`dataset_manifest.csv` は画像単位の管理表です。保存時に `data/annotations/*_annotations.json` を読み直して再生成されるため、複数画像の管理表として使えます。集約版の `annotations.csv` と `counts.csv` も同じタイミングで再生成されます。
+`dataset_manifest.csv` は画像単位の管理表です。保存時に `data/annotations/*_annotations.json` を読み直して再生成されるため、複数画像の管理表として使えます。集計用の `annotations.csv` と `counts.csv` も同じタイミングで再生成されます。
 
-`reviewed` と `exported` は、human-confirmed annotation を学習用に使うための管理フラグです。MVPでは保存前に必須メタデータが空の場合でも保存は可能ですが、警告が表示されます。
-
-保存項目:
-
-- `image_name`
-- `original_image_path`
-- `project_template`
-- `disease_context`
-- `tissue_type`
-- `staining`
-- `objective_magnification`
-- `pixel_size_um`
-- `hpf_area_mm2`
-- `annotator`
-- `reviewed`
-- `exported`
-- `annotation_count`
-- `eosinophil_count`
-- `saved_at`
+`reviewed` と `exported` は、human-confirmed annotation を学習用に使うための管理フラグです。
 
 ## Annotation Coordinates
 
@@ -247,7 +256,7 @@ data/dataset/
 
 このツールは診断用途ではなく、研究用・教師データ作成用です。臨床診断、治療方針決定、病理診断の代替として使用しないでください。
 
-公開Web上の病理画像を無断で使用するのではなく、倫理審査・共同研究・データ利用契約などに基づいて取得された匿名化病理画像を使用してください。`patient_id_hash` などの項目は、直接識別子を保存しないための補助項目です。
+公開Web上の病理画像を無断で使用するのではなく、倫理審査、共同研究契約、データ利用契約などに基づいて取得された匿名化病理画像を使用してください。`patient_id_hash` などの項目は、直接識別子を保存しないための補助項目です。
 
 ## 今後の拡張予定
 
