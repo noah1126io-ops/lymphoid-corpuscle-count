@@ -91,6 +91,23 @@ YOLO_CLASS_IDS = {
     "artifact": 7,
     "ignore": 8,
 }
+CANDIDATE_SOURCES = [
+    "manual",
+    "imported_cellpose",
+    "imported_custom_model",
+    "model_v1",
+]
+ANNOTATION_STATUSES = [
+    "confirmed_by_human",
+    "corrected_by_human",
+    "candidate_unconfirmed",
+    "rejected",
+]
+ANNOTATION_STATUS_FIELDS = [
+    "candidate_source",
+    "annotation_status",
+    "used_for_training",
+]
 
 METADATA_FIELDS = [
     "project_template",
@@ -116,6 +133,10 @@ METADATA_FIELDS = [
 MANIFEST_FIELDS = [
     "image_name",
     "original_image_path",
+    "annotation_json_path",
+    "annotation_csv_path",
+    "count_csv_path",
+    "yolo_label_path",
     "project_template",
     "disease_context",
     "tissue_type",
@@ -367,6 +388,20 @@ def safe_float(value: Any, default: float | None = None) -> float | None:
         return default
 
 
+def safe_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None or value == "":
+        return default
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "y"}:
+            return True
+        if lowered in {"false", "0", "no", "n"}:
+            return False
+    return bool(value)
+
+
 def safe_round(value: float | None, digits: int = 3) -> float | None:
     if value is None:
         return None
@@ -448,6 +483,9 @@ def normalize_canvas_object(
         "y_in_display": safe_round(y_display),
         "scale_factor": safe_round(scale_factor, 6),
         "region_type": region_type,
+        "candidate_source": "manual",
+        "annotation_status": "confirmed_by_human",
+        "used_for_training": True,
         "confidence": 1.0,
         "created_at": obj.get("created_at", created_at),
     }
@@ -485,7 +523,36 @@ def apply_context_to_annotations(
     region_annotations: dict[str, Any],
 ) -> list[dict[str, Any]]:
     region_type = region_annotations.get("global_region_type", "unknown")
-    return [{**item, **metadata, "region_type": item.get("region_type", region_type)} for item in annotations]
+    return [
+        normalize_annotation_status({**item, **metadata, "region_type": item.get("region_type", region_type)})
+        for item in annotations
+    ]
+
+
+def normalize_annotation_status(annotation: dict[str, Any]) -> dict[str, Any]:
+    """Backfill AI-candidate status fields while preserving explicit human review decisions."""
+    normalized = annotation.copy()
+    source = normalized.get("candidate_source") or "manual"
+    if source not in CANDIDATE_SOURCES:
+        source = "manual"
+
+    status = normalized.get("annotation_status")
+    if status not in ANNOTATION_STATUSES:
+        status = "confirmed_by_human" if source == "manual" else "candidate_unconfirmed"
+
+    used_for_training = safe_bool(normalized.get("used_for_training"), source == "manual")
+    if status == "rejected":
+        used_for_training = False
+
+    normalized["candidate_source"] = source
+    normalized["annotation_status"] = status
+    normalized["used_for_training"] = used_for_training
+    return normalized
+
+
+def training_annotations(annotations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized = [normalize_annotation_status(item) for item in annotations]
+    return [item for item in normalized if item.get("used_for_training") is True]
 
 
 def filter_annotations_by_objective(
@@ -639,11 +706,17 @@ def dataset_manifest_row(
     annotations: list[dict[str, Any]],
     saved_at: str,
     image_size: tuple[int, int] | None = None,
+    export_paths: dict[str, Path] | None = None,
 ) -> dict[str, Any]:
     ecrs_counts = calculate_ecrs_counts(annotations, metadata, image_size)
+    export_paths = export_paths or image_export_paths(image_name, metadata)
     return {
         "image_name": image_name,
         "original_image_path": original_image_path,
+        "annotation_json_path": str(export_paths["annotations_json"]),
+        "annotation_csv_path": str(export_paths["annotations_csv"]),
+        "count_csv_path": str(export_paths["counts_csv"]),
+        "yolo_label_path": str(export_paths["yolo_labels"]),
         "project_template": metadata.get("project_template", ""),
         "disease_context": metadata.get("disease_context", ""),
         "tissue_type": metadata.get("tissue_type", ""),
@@ -672,7 +745,7 @@ def yolo_lines(
         return []
 
     lines = []
-    for item in annotations:
+    for item in training_annotations(annotations):
         label = item.get("label")
         if exclude_ignore and label == "ignore":
             continue
@@ -748,8 +821,8 @@ def generate_yolo_training_dataset(
             skipped_images.append(image_name or "unknown")
             continue
 
-        stem = safe_file_stem(image_name)
-        image_destination = DATASET_IMAGE_DIR / image_source.name
+        stem = payload_export_stem(payload)
+        image_destination = DATASET_IMAGE_DIR / f"{stem}{image_source.suffix.lower()}"
         label_destination = DATASET_LABEL_DIR / f"{stem}.txt"
 
         shutil.copy2(image_source, image_destination)
@@ -769,14 +842,36 @@ def generate_yolo_training_dataset(
     }
 
 
-def safe_file_stem(image_name: str) -> str:
-    stem = Path(image_name).stem
-    safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem).strip("._")
-    return safe_stem or "image"
+def safe_file_stem(value: str) -> str:
+    safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("._")
+    return safe_stem or "unknown"
 
 
-def image_export_paths(image_name: str) -> dict[str, Path]:
-    stem = safe_file_stem(image_name)
+def export_file_stem(image_name: str, metadata: dict[str, Any]) -> str:
+    image_stem = safe_file_stem(Path(image_name).stem)
+    specimen_id = safe_file_stem(str(metadata.get("specimen_id", "")))
+    slide_id = safe_file_stem(str(metadata.get("slide_id", "")))
+    if specimen_id != "unknown" and slide_id != "unknown":
+        return f"{specimen_id}_{slide_id}_{image_stem}"
+    if specimen_id != "unknown":
+        return f"{specimen_id}_{image_stem}"
+    if slide_id != "unknown":
+        return f"{slide_id}_{image_stem}"
+    return image_stem or "image"
+
+
+def payload_export_stem(payload: dict[str, Any]) -> str:
+    existing_stem = str(payload.get("export_file_stem", "")).strip()
+    if existing_stem:
+        return safe_file_stem(existing_stem)
+    return export_file_stem(
+        str(payload.get("image_name", "")),
+        payload.get("image_metadata", {}),
+    )
+
+
+def image_export_paths(image_name: str, metadata: dict[str, Any]) -> dict[str, Path]:
+    stem = export_file_stem(image_name, metadata)
     return {
         "annotations_json": ANNOTATION_DIR / f"{stem}_annotations.json",
         "annotations_csv": EXPORT_DIR / f"{stem}_annotations.csv",
@@ -829,6 +924,7 @@ def regenerate_dataset_exports() -> None:
         annotations = payload.get("annotations", [])
         saved_at = payload.get("saved_at", "")
         image_size = image_size_from_payload(payload)
+        export_paths = image_export_paths(image_name, metadata)
 
         manifest_rows.append(
             dataset_manifest_row(
@@ -838,6 +934,7 @@ def regenerate_dataset_exports() -> None:
                 annotations,
                 saved_at,
                 image_size,
+                export_paths,
             )
         )
         annotation_rows.extend(annotations)
@@ -885,19 +982,24 @@ def save_outputs(
     exclude_ignore_from_yolo: bool,
 ) -> dict[str, Path]:
     saved_at = datetime.now().isoformat(timespec="seconds")
-    paths = image_export_paths(image_name)
+    paths = image_export_paths(image_name, metadata)
+    export_stem = export_file_stem(image_name, metadata)
     manifest_path = EXPORT_DIR / "dataset_manifest.csv"
     aggregate_annotations_path = EXPORT_DIR / "annotations.csv"
     aggregate_counts_path = EXPORT_DIR / "counts.csv"
 
     payload = {
-        "schema_version": "2.0",
+        "schema_version": "2.1",
         "image_name": image_name,
         "original_image_path": original_image_path,
+        "export_file_stem": export_stem,
         "labels": LABELS,
         "primary_labels": PRIMARY_LABELS,
         "label_colors": LABEL_COLORS,
         "yolo_class_ids": YOLO_CLASS_IDS,
+        "candidate_sources": CANDIDATE_SOURCES,
+        "annotation_statuses": ANNOTATION_STATUSES,
+        "annotation_status_fields": ANNOTATION_STATUS_FIELDS,
         "image_size": {
             "width": image_size[0] if image_size else None,
             "height": image_size[1] if image_size else None,
@@ -942,9 +1044,9 @@ def save_outputs(
 def load_annotation_payload(uploaded_file: Any) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
     payload = json.loads(uploaded_file.getvalue().decode("utf-8"))
     if isinstance(payload, list):
-        return payload, {}, default_region_annotations()
+        return [normalize_annotation_status(item) for item in payload], {}, default_region_annotations()
     if isinstance(payload, dict):
-        annotations = payload.get("annotations", [])
+        annotations = [normalize_annotation_status(item) for item in payload.get("annotations", [])]
         metadata = payload.get("image_metadata") or metadata_from_restored_annotations(annotations) or {}
         region_annotations = payload.get("region_annotations") or default_region_annotations()
         return annotations, metadata, region_annotations
@@ -1369,12 +1471,15 @@ def main() -> None:
             st.warning("Skipped images: " + ", ".join(dataset_result["skipped"]))
 
     download_payload = {
-        "schema_version": "2.0",
+        "schema_version": "2.1",
         "image_name": st.session_state.image_name,
         "original_image_path": st.session_state.original_image_path,
         "labels": LABELS,
         "primary_labels": PRIMARY_LABELS,
         "yolo_class_ids": YOLO_CLASS_IDS,
+        "candidate_sources": CANDIDATE_SOURCES,
+        "annotation_statuses": ANNOTATION_STATUSES,
+        "annotation_status_fields": ANNOTATION_STATUS_FIELDS,
         "image_metadata": st.session_state.image_metadata,
         "region_annotations": st.session_state.region_annotations,
         "export_objective_filter": objective_filter,
@@ -1422,3 +1527,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

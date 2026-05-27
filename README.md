@@ -1,4 +1,4 @@
-# Manual Granulocyte Annotation Tool
+﻿# Manual Granulocyte Annotation Tool
 
 ECRS、鼻茸、副鼻腔粘膜などのH&E病理画像から、好酸球を中心に手動アノテーションし、将来的なAI検出モデルの教師データを作成するためのStreamlitアプリです。
 
