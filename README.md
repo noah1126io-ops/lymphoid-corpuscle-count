@@ -60,6 +60,8 @@ YOLOクラスIDは次の固定順です。
 
 YOLO学習用エクスポートでは、`ignore` を除外できます。
 
+Cellposeや自前モデルなどの外部候補を将来取り込めるように、アノテーションごとに候補由来と確認状態を保存します。ただし、Cellpose自体は必須依存には含めていません。
+
 ## 使い方
 
 1. `Upload tissue image` から jpg / png / tif / tiff 画像をアップロードします。
@@ -225,6 +227,36 @@ eos_per_HPF = eos_per_mm2 * hpf_area_mm2
 
 後方互換のため、従来の `x`, `y`, `width`, `height` も元画像座標として保持します。
 
+## Annotation Status
+
+AI候補提示や外部ツール由来の候補を、手動で確定したアノテーションと区別するため、各アノテーションに次のフィールドを保存します。
+
+- `candidate_source`: `manual`, `imported_cellpose`, `imported_custom_model`, `model_v1`
+- `annotation_status`: `confirmed_by_human`, `corrected_by_human`, `candidate_unconfirmed`, `rejected`
+- `used_for_training`: `true` または `false`
+
+手動で描いたアノテーションは、デフォルトで次の値になります。
+
+```json
+{
+  "candidate_source": "manual",
+  "annotation_status": "confirmed_by_human",
+  "used_for_training": true
+}
+```
+
+将来的にCellposeや自前モデルから候補を読み込む場合、未確認候補は原則として次の扱いにします。
+
+```json
+{
+  "candidate_source": "imported_cellpose",
+  "annotation_status": "candidate_unconfirmed",
+  "used_for_training": false
+}
+```
+
+`rejected` のアノテーションは、`used_for_training=false` として扱います。YOLO export、将来のcrop export、training dataset exportでは、`used_for_training=true` のアノテーションだけを使います。これにより、human-confirmed annotationのみを学習用に使う方針を保てます。
+
 ## YOLO変換
 
 YOLO形式は次の形式で保存されます。
@@ -233,7 +265,7 @@ YOLO形式は次の形式で保存されます。
 class_id x_center_norm y_center_norm width_norm height_norm
 ```
 
-座標は元画像サイズで正規化されます。`ignore` ラベルは、UIのチェックボックスでYOLO出力から除外できます。
+座標は元画像サイズで正規化されます。`ignore` ラベルは、UIのチェックボックスでYOLO出力から除外できます。さらに、YOLO出力には `used_for_training=true` のアノテーションのみが含まれます。
 
 ## YOLO学習用エクスポート
 
@@ -246,7 +278,7 @@ data/dataset/
 └── data.yaml
 ```
 
-初期設定では `reviewed` または `exported` が付いた画像だけを対象にします。これは、完全手動で確認された human-confirmed annotation のみを学習用に使うためです。`ignore` ラベルは `Exclude ignore from YOLO export` により除外できます。
+初期設定では `reviewed` または `exported` が付いた画像だけを対象にします。これは、完全手動で確認された human-confirmed annotation のみを学習用に使うためです。`ignore` ラベルは `Exclude ignore from YOLO export` により除外できます。各画像内では `used_for_training=true` のアノテーションのみがYOLO labelへ変換されます。
 
 現時点のMVPでは train / val / test の厳密な分割は行わず、同じ `images` ディレクトリを `data.yaml` の train / val / test に指定します。これは動作確認用の暫定仕様です。
 
