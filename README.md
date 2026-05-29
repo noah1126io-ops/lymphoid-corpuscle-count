@@ -20,6 +20,8 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+NDPIファイルを扱う場合は、`openslide-python`, `openslide-bin`, `tifffile`, `numpy` が必要です。これらは `requirements.txt` に含まれています。Cellpose / Cellpose-SAM は必須依存には含めていません。
+
 ## 実行方法
 
 ```bash
@@ -64,7 +66,7 @@ Cellposeや自前モデルなどの外部候補を将来取り込めるように
 
 ## 使い方
 
-1. `Upload tissue image` から jpg / png / tif / tiff 画像をアップロードします。
+1. `Upload tissue image` から jpg / png / tif / tiff / ndpi 画像をアップロードします。
 2. `Project Template` で `ECRS_nasal_polyp` などを選びます。
 3. `Image Metadata` に疾患背景、組織種、染色、倍率、標本ID、アノテーターなどを入力します。
 4. `Region Type` で画像全体の領域タイプを選びます。
@@ -73,6 +75,17 @@ Cellposeや自前モデルなどの外部候補を将来取り込めるように
 7. `Export Settings` で倍率フィルタやYOLOの `ignore` 除外を設定します。
 8. `Save / Restore` から過去の `annotations.json` を読み込めます。
 9. 画面下部の `Save exports` で各種ファイルを保存します。
+
+## NDPI to OME-TIFF
+
+NDPIファイルはPillowだけでは直接読み込めないため、アップロード時にOpenSlideで読み込み、OME-TIFFへ変換してから既存のアノテーション画面に表示します。
+
+- 元のNDPI: `data/images/original_ndpi/<file_name>.ndpi`
+- 変換後OME-TIFF: `data/images/converted/<file_stem>.ome.tiff`
+
+変換後のOME-TIFFが既に存在し、元NDPIより新しい場合は再変換せず再利用します。大きなNDPIでは、メモリ使用量を抑えるため、OpenSlideのピラミッドレベルから `MAX_NDPI_CONVERSION_PIXELS` 以下になるレベルを選んで変換します。そのため、初期MVPではフル解像度NDPI全体を常にOME-TIFF化する設計ではありません。
+
+NDPI由来のannotationでは、`image_name` と `original_image_path` は変換後OME-TIFFを基準に保存されます。元NDPIは `data/images/original_ndpi/` に保持されます。
 
 ## Project Templates
 
@@ -293,6 +306,8 @@ data/dataset/
 ├── README.md
 └── data
     ├── images
+    │   ├── converted
+    │   └── original_ndpi
     ├── annotations
     ├── dataset
     │   ├── images

@@ -220,6 +220,8 @@ TEMPLATE_DEFAULTS = {
 
 DATA_DIR = Path("data")
 IMAGE_DIR = DATA_DIR / "images"
+ORIGINAL_NDPI_DIR = IMAGE_DIR / "original_ndpi"
+CONVERTED_IMAGE_DIR = IMAGE_DIR / "converted"
 ANNOTATION_DIR = DATA_DIR / "annotations"
 EXPORT_DIR = DATA_DIR / "exports"
 YOLO_DIR = EXPORT_DIR / "yolo_labels"
@@ -228,6 +230,8 @@ DATASET_IMAGE_DIR = DATASET_DIR / "images"
 DATASET_LABEL_DIR = DATASET_DIR / "labels"
 MAX_DISPLAY_WIDTH = 1100
 MAX_DISPLAY_HEIGHT = 900
+NDPI_EXTENSIONS = {".ndpi"}
+MAX_NDPI_CONVERSION_PIXELS = 30_000_000
 
 # Research TIFF files can be very large. The app still downscales for display,
 # but Pillow needs permission to open the original dimensions first.
@@ -288,7 +292,16 @@ def disable_canvas_context_menu() -> None:
 
 
 def ensure_directories() -> None:
-    for path in (IMAGE_DIR, ANNOTATION_DIR, EXPORT_DIR, YOLO_DIR, DATASET_IMAGE_DIR, DATASET_LABEL_DIR):
+    for path in (
+        IMAGE_DIR,
+        ORIGINAL_NDPI_DIR,
+        CONVERTED_IMAGE_DIR,
+        ANNOTATION_DIR,
+        EXPORT_DIR,
+        YOLO_DIR,
+        DATASET_IMAGE_DIR,
+        DATASET_LABEL_DIR,
+    ):
         path.mkdir(parents=True, exist_ok=True)
 
 
@@ -328,6 +341,7 @@ def default_region_annotations(region_type: str = "unknown") -> dict[str, Any]:
 def init_session_state() -> None:
     defaults = {
         "image_name": None,
+        "uploaded_source_name": None,
         "original_image_path": "",
         "image_original_size": None,
         "display_size": None,
@@ -359,6 +373,16 @@ def load_image(uploaded_file: Any) -> Image.Image:
     return image
 
 
+def load_image_from_path(image_path: Path) -> Image.Image:
+    image = Image.open(image_path)
+    if getattr(image, "n_frames", 1) > 1:
+        image.seek(0)
+    image = ImageOps.exif_transpose(image)
+    if image.mode not in ("RGB", "RGBA"):
+        image = image.convert("RGB")
+    return image
+
+
 def make_display_image(image: Image.Image) -> tuple[Image.Image, float]:
     width, height = image.size
     scale_factor = min(MAX_DISPLAY_WIDTH / width, MAX_DISPLAY_HEIGHT / height, 1.0)
@@ -372,11 +396,103 @@ def make_display_image(image: Image.Image) -> tuple[Image.Image, float]:
 
 
 def save_uploaded_image(uploaded_file: Any) -> Path:
-    destination = IMAGE_DIR / uploaded_file.name
+    return save_uploaded_file(uploaded_file, IMAGE_DIR / uploaded_file.name)
+
+
+def save_uploaded_file(uploaded_file: Any, destination: Path) -> Path:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    uploaded_size = getattr(uploaded_file, "size", None)
+    if destination.exists() and uploaded_size and destination.stat().st_size == uploaded_size:
+        return destination
     uploaded_file.seek(0)
     with destination.open("wb") as output_file:
         shutil.copyfileobj(uploaded_file, output_file)
     return destination
+
+
+def is_ndpi_file(filename: str) -> bool:
+    return Path(filename).suffix.lower() in NDPI_EXTENSIONS
+
+
+def converted_ome_tiff_path(filename: str) -> Path:
+    return CONVERTED_IMAGE_DIR / f"{safe_file_stem(Path(filename).stem)}.ome.tiff"
+
+
+def select_openslide_level(level_dimensions: tuple[tuple[int, int], ...]) -> int:
+    suitable_levels = [
+        (index, width * height)
+        for index, (width, height) in enumerate(level_dimensions)
+        if width * height <= MAX_NDPI_CONVERSION_PIXELS
+    ]
+    if suitable_levels:
+        return max(suitable_levels, key=lambda item: item[1])[0]
+    return len(level_dimensions) - 1
+
+
+def convert_ndpi_to_ome_tiff(ndpi_path: Path, output_path: Path) -> dict[str, Any]:
+    if output_path.exists() and output_path.stat().st_mtime >= ndpi_path.stat().st_mtime:
+        return {"converted": False, "output_path": str(output_path), "reason": "existing_ome_tiff_reused"}
+
+    try:
+        import numpy as np
+        import openslide
+        import tifffile
+    except ImportError as error:
+        raise RuntimeError(
+            "NDPI conversion requires openslide-python, openslide-bin, tifffile, and numpy. "
+            "Run: pip install -r requirements.txt"
+        ) from error
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    slide = openslide.OpenSlide(str(ndpi_path))
+    try:
+        level = select_openslide_level(tuple(slide.level_dimensions))
+        width, height = slide.level_dimensions[level]
+        downsample = float(slide.level_downsamples[level])
+        region = slide.read_region((0, 0), level, (width, height)).convert("RGB")
+        image_array = np.asarray(region)
+    finally:
+        slide.close()
+
+    tifffile.imwrite(
+        output_path,
+        image_array,
+        ome=True,
+        photometric="rgb",
+        compression="deflate",
+        metadata={"axes": "YXS"},
+    )
+    return {
+        "converted": True,
+        "output_path": str(output_path),
+        "openslide_level": level,
+        "level_downsample": downsample,
+        "converted_width": width,
+        "converted_height": height,
+    }
+
+
+def prepare_uploaded_image(uploaded_file: Any) -> dict[str, Any]:
+    if is_ndpi_file(uploaded_file.name):
+        original_path = save_uploaded_file(uploaded_file, ORIGINAL_NDPI_DIR / uploaded_file.name)
+        converted_path = converted_ome_tiff_path(uploaded_file.name)
+        conversion = convert_ndpi_to_ome_tiff(original_path, converted_path)
+        return {
+            "image_name": converted_path.name,
+            "image_path": converted_path,
+            "source_image_path": original_path,
+            "source_format": "ndpi",
+            "conversion": conversion,
+        }
+
+    image_path = save_uploaded_image(uploaded_file)
+    return {
+        "image_name": uploaded_file.name,
+        "image_path": image_path,
+        "source_image_path": image_path,
+        "source_format": Path(uploaded_file.name).suffix.lower().lstrip("."),
+        "conversion": {},
+    }
 
 
 def safe_float(value: Any, default: float | None = None) -> float | None:
@@ -1229,10 +1345,11 @@ def render_sidebar() -> tuple[Any, Any, str, dict[str, Any], dict[str, Any], str
     st.sidebar.subheader("Upload tissue image")
     uploaded_image = st.sidebar.file_uploader(
         "Upload tissue image",
-        type=["jpg", "jpeg", "png", "tif", "tiff"],
+        type=["jpg", "jpeg", "png", "tif", "tiff", "ndpi"],
     )
-    if uploaded_image and st.session_state.image_name != uploaded_image.name:
+    if uploaded_image and st.session_state.uploaded_source_name != uploaded_image.name:
         reset_for_new_image()
+        st.session_state.uploaded_source_name = uploaded_image.name
 
     project_template = render_project_template()
     metadata = render_metadata_inputs(project_template)
@@ -1278,16 +1395,20 @@ def render_ecrs_notice(project_template: str) -> None:
         )
 
 
-def process_upload(uploaded_image: Any, uploaded_annotations: Any, display_image: Image.Image) -> None:
-    image_key = f"{uploaded_image.name}:{uploaded_image.size}"
+def process_upload(
+    uploaded_image: Any,
+    uploaded_annotations: Any,
+    display_image: Image.Image,
+    prepared_image: dict[str, Any],
+) -> None:
+    image_key = f"{uploaded_image.name}:{uploaded_image.size}:{prepared_image['image_name']}"
     if st.session_state.saved_image_key != image_key:
-        image_path = save_uploaded_image(uploaded_image)
-        st.session_state.original_image_path = str(image_path)
+        st.session_state.original_image_path = str(prepared_image["image_path"])
         st.session_state.saved_image_key = image_key
 
-    st.session_state.image_name = uploaded_image.name
+    st.session_state.image_name = str(prepared_image["image_name"])
     if uploaded_annotations:
-        restore_key = f"{uploaded_image.name}:{uploaded_annotations.name}:{uploaded_annotations.size}"
+        restore_key = f"{prepared_image['image_name']}:{uploaded_annotations.name}:{uploaded_annotations.size}"
         if st.session_state.restored_annotations_key != restore_key:
             restored, restored_metadata, restored_regions = load_annotation_payload(uploaded_annotations)
             st.session_state.annotation_table = restored
@@ -1334,15 +1455,30 @@ def main() -> None:
     render_ecrs_notice(metadata.get("project_template", "custom"))
 
     if not uploaded_image:
-        st.info("Upload a jpg, png, tif, or tiff image to begin annotation.")
+        st.info("Upload a jpg, png, tif, tiff, or ndpi image to begin annotation.")
         return
 
-    image = load_image(uploaded_image)
+    try:
+        prepared_image = prepare_uploaded_image(uploaded_image)
+    except RuntimeError as error:
+        st.error(str(error))
+        return
+
+    if prepared_image["source_format"] == "ndpi":
+        conversion = prepared_image.get("conversion", {})
+        st.info(
+            "NDPI was converted to OME-TIFF for annotation: "
+            f"{prepared_image['source_image_path']} -> {prepared_image['image_path']} "
+            f"(level={conversion.get('openslide_level', 'reused')}, "
+            f"downsample={conversion.get('level_downsample', 'existing')})"
+        )
+
+    image = load_image_from_path(prepared_image["image_path"])
     display_image, scale_factor = make_display_image(image)
     st.session_state.image_original_size = image.size
     st.session_state.display_size = display_image.size
     st.session_state.scale_factor = scale_factor
-    process_upload(uploaded_image, uploaded_annotations, display_image)
+    process_upload(uploaded_image, uploaded_annotations, display_image, prepared_image)
 
     canvas_width, canvas_height = display_image.size
     initial_json = None
