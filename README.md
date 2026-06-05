@@ -30,6 +30,8 @@ streamlit run app.py
 
 ブラウザで表示されたローカルURLを開きます。
 
+このリポジトリでは `.streamlit/config.toml` でアップロード上限を `2048 MB` に設定しています。Streamlitの既定値は `200 MB` なので、大きなNDPI/WSIを扱う場合はこの設定が必要です。さらに大きいファイルを扱う場合は、PCのメモリと保存容量を確認したうえで `maxUploadSize` を調整してください。
+
 ## ECRS / Nasal Polyp Template
 
 `ECRS_nasal_polyp` テンプレートは、H&E染色された鼻茸または副鼻腔粘膜画像における好酸球カウント支援データ作成を想定しています。

@@ -1,7 +1,8 @@
 __pycache__/
 *.py[cod]
 .venv/
-.streamlit/
+.streamlit/*
+!.streamlit/config.toml
 
 # Keep directory structure, but do not publish research images or generated data.
 data/images/*
