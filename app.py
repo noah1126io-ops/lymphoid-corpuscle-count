@@ -106,10 +106,12 @@ YOLO_CLASS_IDS = {
 }
 CANDIDATE_SOURCES = [
     "manual",
+    "imported_open_eoe",
     "imported_cellpose",
     "imported_custom_model",
     "model_v1",
 ]
+CANDIDATE_IMPORT_SOURCES = [source for source in CANDIDATE_SOURCES if source != "manual"]
 ANNOTATION_STATUSES = [
     "confirmed_by_human",
     "corrected_by_human",
@@ -431,6 +433,7 @@ def init_session_state() -> None:
         "canvas_key_version": 0,
         "canvas_initial_drawing_pending": True,
         "last_saved_message": "",
+        "candidate_import_key": None,
         "active_patch": None,
         "active_patch_source": None,
         "project_template": "ECRS_nasal_polyp",
@@ -789,6 +792,12 @@ def normalize_canvas_object(
     height_original = height_display * inverse_scale
     x_original = x_display * inverse_scale
     y_original = y_display * inverse_scale
+    candidate_source = obj.get("candidate_source", "manual")
+    if candidate_source not in CANDIDATE_SOURCES:
+        candidate_source = "manual"
+    default_status = "confirmed_by_human" if candidate_source == "manual" else "candidate_unconfirmed"
+    annotation_status = obj.get("annotation_status", default_status)
+    used_for_training = safe_bool(obj.get("used_for_training"), candidate_source == "manual")
 
     return {
         "image_name": image_name,
@@ -806,10 +815,12 @@ def normalize_canvas_object(
         "y_in_display": safe_round(y_display),
         "scale_factor": safe_round(scale_factor, 6),
         "region_type": region_type,
-        "candidate_source": "manual",
-        "annotation_status": "confirmed_by_human",
-        "used_for_training": True,
-        "confidence": 1.0,
+        "candidate_source": candidate_source,
+        "annotation_status": annotation_status,
+        "used_for_training": used_for_training,
+        "source_model": obj.get("source_model", ""),
+        "source_image_name": obj.get("source_image_name", image_name),
+        "confidence": safe_float(obj.get("confidence"), 1.0),
         "created_at": obj.get("created_at", created_at),
     }
 
@@ -904,6 +915,13 @@ def training_annotations(annotations: list[dict[str, Any]]) -> list[dict[str, An
     return [item for item in normalized if item.get("used_for_training") is True]
 
 
+def exportable_annotations(annotations: list[dict[str, Any]], used_for_training_only: bool) -> list[dict[str, Any]]:
+    if used_for_training_only:
+        return training_annotations(annotations)
+    normalized = [normalize_annotation_status(item) for item in annotations]
+    return [item for item in normalized if item.get("annotation_status") != "rejected"]
+
+
 def filter_annotations_by_objective(
     annotations: list[dict[str, Any]],
     objective_filter: str,
@@ -949,6 +967,12 @@ def fabric_object_from_annotation(annotation: dict[str, Any], scale_factor: floa
         "scaleX": 1,
         "scaleY": 1,
         "label": label,
+        "candidate_source": annotation.get("candidate_source", "manual"),
+        "annotation_status": annotation.get("annotation_status", "confirmed_by_human"),
+        "used_for_training": bool(annotation.get("used_for_training", True)),
+        "source_model": annotation.get("source_model", ""),
+        "source_image_name": annotation.get("source_image_name", annotation.get("image_name", "")),
+        "confidence": safe_float(annotation.get("confidence"), 1.0),
         "created_at": annotation.get("created_at", datetime.now().isoformat(timespec="seconds")),
     }
 
@@ -966,6 +990,119 @@ def canvas_json_from_annotations(
         "width": width,
         "height": height,
     }
+
+
+def candidate_rows_from_file(uploaded_file: Any) -> list[dict[str, Any]]:
+    suffix = Path(uploaded_file.name).suffix.lower()
+    if suffix == ".csv":
+        uploaded_file.seek(0)
+        return pd.read_csv(uploaded_file).fillna("").to_dict(orient="records")
+
+    payload = json.loads(uploaded_file.getvalue().decode("utf-8"))
+    if isinstance(payload, list):
+        return [row for row in payload if isinstance(row, dict)]
+    if isinstance(payload, dict):
+        candidates = payload.get("candidates", payload.get("annotations", []))
+        if isinstance(candidates, list):
+            return [row for row in candidates if isinstance(row, dict)]
+    return []
+
+
+def candidate_source_from_row(row: dict[str, Any], fallback_source: str) -> str:
+    source_model = str(row.get("source_model", "")).lower()
+    if "open" in source_model and "eoe" in source_model:
+        return "imported_open_eoe"
+    if "cellpose" in source_model:
+        return "imported_cellpose"
+    return fallback_source if fallback_source in CANDIDATE_IMPORT_SOURCES else "imported_custom_model"
+
+
+def normalize_imported_candidate(
+    row: dict[str, Any],
+    image_name: str,
+    metadata: dict[str, Any],
+    fallback_source: str,
+    imported_at: str,
+) -> dict[str, Any] | None:
+    source_model = str(row.get("source_model", "")).strip()
+    source_image_name = str(row.get("source_image_name", "")).strip()
+    if not source_model or not source_image_name:
+        return None
+    label = str(row.get("label", "eosinophil")).strip()
+    if label not in LABELS:
+        label = "other_cell"
+
+    x_value = safe_float(row.get("x_in_patch"), safe_float(row.get("x_original")))
+    y_value = safe_float(row.get("y_in_patch"), safe_float(row.get("y_original")))
+    box_width = safe_float(
+        row.get("bbox_width"),
+        safe_float(row.get("bbox_width_original"), safe_float(row.get("width"))),
+    )
+    box_height = safe_float(
+        row.get("bbox_height"),
+        safe_float(row.get("bbox_height_original"), safe_float(row.get("height"))),
+    )
+    confidence = safe_float(row.get("confidence"), 0.0)
+    if None in (x_value, y_value, box_width, box_height):
+        return None
+    if box_width <= 0 or box_height <= 0:
+        return None
+
+    patch_x = row.get("patch_x", metadata.get("patch_x", ""))
+    patch_y = row.get("patch_y", metadata.get("patch_y", ""))
+    patch_x_float = safe_float(patch_x)
+    patch_y_float = safe_float(patch_y)
+    x_wsi = safe_float(row.get("x_wsi"))
+    y_wsi = safe_float(row.get("y_wsi"))
+    if x_wsi is None and patch_x_float is not None:
+        x_wsi = patch_x_float + x_value
+    if y_wsi is None and patch_y_float is not None:
+        y_wsi = patch_y_float + y_value
+
+    return normalize_annotation_status(
+        {
+            "image_name": image_name,
+            "source_model": source_model,
+            "source_image_name": source_image_name,
+            "label": label,
+            "x": safe_round(x_value),
+            "y": safe_round(y_value),
+            "width": safe_round(box_width),
+            "height": safe_round(box_height),
+            "x_original": safe_round(x_value),
+            "y_original": safe_round(y_value),
+            "bbox_width_original": safe_round(box_width),
+            "bbox_height_original": safe_round(box_height),
+            "x_in_patch": safe_round(x_value),
+            "y_in_patch": safe_round(y_value),
+            "x_wsi": safe_round(x_wsi),
+            "y_wsi": safe_round(y_wsi),
+            "patch_id": row.get("patch_id", metadata.get("patch_id", "")),
+            "patch_x": patch_x,
+            "patch_y": patch_y,
+            "source_wsi_name": metadata.get("source_wsi_name", ""),
+            "candidate_source": candidate_source_from_row(row, fallback_source),
+            "annotation_status": "candidate_unconfirmed",
+            "used_for_training": False,
+            "confidence": confidence,
+            "created_at": imported_at,
+        }
+    )
+
+
+def imported_candidate_annotations(
+    uploaded_file: Any,
+    image_name: str,
+    metadata: dict[str, Any],
+    fallback_source: str,
+) -> list[dict[str, Any]]:
+    imported_at = datetime.now().isoformat(timespec="seconds")
+    annotations = []
+    for row in candidate_rows_from_file(uploaded_file):
+        annotation = normalize_imported_candidate(row, image_name, metadata, fallback_source, imported_at)
+        if annotation:
+            annotations.append(annotation)
+    return annotations
 
 
 def image_area_mm2_from_pixel_size(
@@ -1097,6 +1234,7 @@ def yolo_lines(
     annotations: list[dict[str, Any]],
     image_size: tuple[int, int] | None,
     exclude_ignore: bool,
+    used_for_training_only: bool = True,
 ) -> list[str]:
     if not image_size:
         return []
@@ -1105,7 +1243,7 @@ def yolo_lines(
         return []
 
     lines = []
-    for item in training_annotations(annotations):
+    for item in exportable_annotations(annotations, used_for_training_only):
         label = item.get("label")
         if exclude_ignore and label == "ignore":
             continue
@@ -1163,6 +1301,7 @@ def source_image_path(payload: dict[str, Any]) -> Path | None:
 def generate_yolo_training_dataset(
     only_reviewed_or_exported: bool,
     exclude_ignore: bool,
+    used_for_training_only: bool,
 ) -> dict[str, Any]:
     ensure_directories()
     exported_images = 0
@@ -1188,7 +1327,14 @@ def generate_yolo_training_dataset(
 
         shutil.copy2(image_source, image_destination)
         label_destination.write_text(
-            "\n".join(yolo_lines(payload.get("annotations", []), image_size, exclude_ignore)),
+            "\n".join(
+                yolo_lines(
+                    payload.get("annotations", []),
+                    image_size,
+                    exclude_ignore,
+                    used_for_training_only,
+                )
+            ),
             encoding="utf-8",
         )
         exported_images += 1
@@ -1347,6 +1493,7 @@ def save_outputs(
     region_annotations: dict[str, Any],
     objective_filter: str,
     exclude_ignore_from_yolo: bool,
+    used_for_training_only_export: bool,
 ) -> dict[str, Path]:
     saved_at = datetime.now().isoformat(timespec="seconds")
     paths = image_export_paths(image_name, metadata)
@@ -1357,7 +1504,7 @@ def save_outputs(
     metadata_path = EXPORT_DIR / "metadata.csv"
 
     payload = {
-        "schema_version": "2.2",
+        "schema_version": "2.3",
         "image_name": image_name,
         "original_image_path": original_image_path,
         "export_file_stem": export_stem,
@@ -1393,7 +1540,14 @@ def save_outputs(
         encoding="utf-8-sig",
     )
     paths["yolo_labels"].write_text(
-        "\n".join(yolo_lines(annotations, image_size, exclude_ignore_from_yolo)),
+        "\n".join(
+            yolo_lines(
+                annotations,
+                image_size,
+                exclude_ignore_from_yolo,
+                used_for_training_only_export,
+            )
+        ),
         encoding="utf-8",
     )
     regenerate_dataset_exports()
@@ -1627,7 +1781,22 @@ def reset_for_new_image() -> None:
     st.session_state.canvas_initial_drawing_pending = True
 
 
-def render_sidebar() -> tuple[Any, Any, str, dict[str, Any], dict[str, Any], str, str, str, int, bool, bool]:
+def render_sidebar() -> tuple[
+    Any,
+    Any,
+    Any,
+    str,
+    str,
+    dict[str, Any],
+    dict[str, Any],
+    str,
+    str,
+    str,
+    int,
+    bool,
+    bool,
+    bool,
+]:
     st.sidebar.subheader("Upload tissue image")
     uploaded_image = st.sidebar.file_uploader(
         "Upload tissue image",
@@ -1649,6 +1818,11 @@ def render_sidebar() -> tuple[Any, Any, str, dict[str, Any], dict[str, Any], str
         index=0,
     )
     exclude_ignore_from_yolo = st.sidebar.checkbox("Exclude ignore from YOLO export", value=True)
+    used_for_training_only_export = st.sidebar.checkbox(
+        "Export used_for_training only",
+        value=True,
+        help="Keep this enabled for training exports. Unconfirmed imported candidates stay out of training data.",
+    )
     only_reviewed_or_exported = st.sidebar.checkbox(
         "YOLO dataset: reviewed/exported only",
         value=True,
@@ -1657,10 +1831,19 @@ def render_sidebar() -> tuple[Any, Any, str, dict[str, Any], dict[str, Any], str
 
     st.sidebar.subheader("Save / Restore")
     uploaded_annotations = st.sidebar.file_uploader("Restore annotations.json", type=["json"])
+    st.sidebar.subheader("Candidate Import")
+    uploaded_candidates = st.sidebar.file_uploader("Import candidate bbox CSV/JSON", type=["csv", "json"])
+    candidate_import_source = st.sidebar.selectbox(
+        "candidate_source for import",
+        CANDIDATE_IMPORT_SOURCES,
+        index=CANDIDATE_IMPORT_SOURCES.index("imported_open_eoe"),
+    )
 
     return (
         uploaded_image,
         uploaded_annotations,
+        uploaded_candidates,
+        candidate_import_source,
         objective_filter,
         metadata,
         region_annotations,
@@ -1669,6 +1852,7 @@ def render_sidebar() -> tuple[Any, Any, str, dict[str, Any], dict[str, Any], str
         stroke_color,
         stroke_width,
         exclude_ignore_from_yolo,
+        used_for_training_only_export,
         only_reviewed_or_exported,
     )
 
@@ -1808,6 +1992,69 @@ def process_upload(
             st.session_state.canvas_initial_drawing_pending = True
 
 
+def process_candidate_import(
+    uploaded_candidates: Any,
+    candidate_import_source: str,
+    display_image: Image.Image,
+) -> None:
+    if not uploaded_candidates or not st.session_state.image_name:
+        return
+    import_key = (
+        f"{st.session_state.image_name}:{uploaded_candidates.name}:"
+        f"{uploaded_candidates.size}:{candidate_import_source}"
+    )
+    if st.session_state.candidate_import_key == import_key:
+        return
+
+    imported = imported_candidate_annotations(
+        uploaded_candidates,
+        st.session_state.image_name,
+        st.session_state.image_metadata,
+        candidate_import_source,
+    )
+    if not imported:
+        st.warning("No valid candidate bboxes were imported. Check required columns/fields.")
+        st.session_state.candidate_import_key = import_key
+        return
+
+    existing = st.session_state.annotation_table or []
+    st.session_state.annotation_table = [*existing, *imported]
+    st.session_state.canvas_objects = canvas_json_from_annotations(
+        st.session_state.annotation_table,
+        display_image.size[0],
+        display_image.size[1],
+        st.session_state.scale_factor,
+    )["objects"]
+    st.session_state.candidate_import_key = import_key
+    st.session_state.canvas_key_version += 1
+    st.session_state.canvas_initial_drawing_pending = True
+    st.success(f"Imported {len(imported)} candidate bboxes as unconfirmed annotations.")
+
+
+def update_imported_candidate_status(annotation_status: str, used_for_training: bool) -> None:
+    updated = []
+    for item in st.session_state.annotation_table:
+        if item.get("candidate_source", "manual") != "manual":
+            updated.append(
+                {
+                    **item,
+                    "annotation_status": annotation_status,
+                    "used_for_training": used_for_training,
+                }
+            )
+        else:
+            updated.append(item)
+    st.session_state.annotation_table = updated
+    st.session_state.canvas_objects = canvas_json_from_annotations(
+        updated,
+        st.session_state.display_size[0],
+        st.session_state.display_size[1],
+        st.session_state.scale_factor,
+    )["objects"]
+    st.session_state.canvas_key_version += 1
+    st.session_state.canvas_initial_drawing_pending = True
+
+
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     patch_drawable_canvas_for_streamlit()
@@ -1818,6 +2065,8 @@ def main() -> None:
     (
         uploaded_image,
         uploaded_annotations,
+        uploaded_candidates,
+        candidate_import_source,
         objective_filter,
         metadata,
         region_annotations,
@@ -1826,6 +2075,7 @@ def main() -> None:
         stroke_color,
         stroke_width,
         exclude_ignore_from_yolo,
+        used_for_training_only_export,
         only_reviewed_or_exported,
     ) = render_sidebar()
 
@@ -1869,6 +2119,7 @@ def main() -> None:
     st.session_state.display_size = display_image.size
     st.session_state.scale_factor = scale_factor
     process_upload(uploaded_image, uploaded_annotations, display_image, prepared_image)
+    process_candidate_import(uploaded_candidates, candidate_import_source, display_image)
 
     canvas_width, canvas_height = display_image.size
     initial_json = None
@@ -1963,6 +2214,17 @@ def main() -> None:
             + ". Saving is still allowed for this MVP."
         )
 
+    imported_count = sum(1 for item in st.session_state.annotation_table if item.get("candidate_source", "manual") != "manual")
+    if imported_count:
+        st.caption(f"Imported candidate annotations in current image: {imported_count}")
+        candidate_cols = st.columns(2)
+        if candidate_cols[0].button("Confirm all imported candidates", use_container_width=True):
+            update_imported_candidate_status("confirmed_by_human", True)
+            st.rerun()
+        if candidate_cols[1].button("Reject all imported candidates", use_container_width=True):
+            update_imported_candidate_status("rejected", False)
+            st.rerun()
+
     if st.button("Refresh canvas", disabled=save_disabled, use_container_width=True):
         st.session_state.canvas_key_version += 1
         st.session_state.canvas_initial_drawing_pending = True
@@ -1979,6 +2241,7 @@ def main() -> None:
             st.session_state.region_annotations,
             objective_filter,
             exclude_ignore_from_yolo,
+            used_for_training_only_export,
         )
         st.session_state.last_saved_message = "Saved: " + " / ".join(str(path) for path in paths.values())
         st.rerun()
@@ -1987,6 +2250,7 @@ def main() -> None:
         dataset_result = generate_yolo_training_dataset(
             only_reviewed_or_exported=only_reviewed_or_exported,
             exclude_ignore=exclude_ignore_from_yolo,
+            used_for_training_only=used_for_training_only_export,
         )
         st.success(
             "YOLO dataset generated: "
@@ -1997,7 +2261,7 @@ def main() -> None:
             st.warning("Skipped images: " + ", ".join(dataset_result["skipped"]))
 
     download_payload = {
-        "schema_version": "2.2",
+        "schema_version": "2.3",
         "image_name": st.session_state.image_name,
         "original_image_path": st.session_state.original_image_path,
         "labels": LABELS,
@@ -2009,6 +2273,7 @@ def main() -> None:
         "image_metadata": st.session_state.image_metadata,
         "region_annotations": st.session_state.region_annotations,
         "export_objective_filter": objective_filter,
+        "used_for_training_only_export": used_for_training_only_export,
         "annotations": export_annotations,
     }
     dl_cols = st.columns(4)
@@ -2043,7 +2308,14 @@ def main() -> None:
     )
     dl_cols[3].download_button(
         "Download YOLO label",
-        data="\n".join(yolo_lines(export_annotations, st.session_state.image_original_size, exclude_ignore_from_yolo)),
+        data="\n".join(
+            yolo_lines(
+                export_annotations,
+                st.session_state.image_original_size,
+                exclude_ignore_from_yolo,
+                used_for_training_only_export,
+            )
+        ),
         file_name=f"{Path(st.session_state.image_name).stem}.txt",
         mime="text/plain",
         disabled=save_disabled,

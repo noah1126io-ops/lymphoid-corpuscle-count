@@ -62,7 +62,7 @@ YOLOクラスIDは次の固定順です。
 
 YOLO学習用エクスポートでは、`ignore` を除外できます。
 
-Cellposeや自前モデルなどの外部候補を将来取り込めるように、アノテーションごとに候補由来と確認状態を保存します。ただし、Cellpose自体は必須依存には含めていません。
+Cellpose、Open-EoE、自前モデルなどの外部候補を取り込めるように、アノテーションごとに候補由来と確認状態を保存します。ただし、CellposeやOpen-EoE自体は必須依存には含めていません。
 
 ## 使い方
 
@@ -291,7 +291,7 @@ patch画像でアノテーションする場合、`x_original` と `y_original` 
 
 AI候補提示や外部ツール由来の候補を、手動で確定したアノテーションと区別するため、各アノテーションに次のフィールドを保存します。
 
-- `candidate_source`: `manual`, `imported_cellpose`, `imported_custom_model`, `model_v1`
+- `candidate_source`: `manual`, `imported_open_eoe`, `imported_cellpose`, `imported_custom_model`, `model_v1`
 - `annotation_status`: `confirmed_by_human`, `corrected_by_human`, `candidate_unconfirmed`, `rejected`
 - `used_for_training`: `true` または `false`
 
@@ -305,17 +305,46 @@ AI候補提示や外部ツール由来の候補を、手動で確定したアノ
 }
 ```
 
-将来的にCellposeや自前モデルから候補を読み込む場合、未確認候補は原則として次の扱いにします。
+Open-EoE、Cellpose、自前モデルなどから候補を読み込む場合、未確認候補は原則として次の扱いにします。
 
 ```json
 {
-  "candidate_source": "imported_cellpose",
+  "candidate_source": "imported_open_eoe",
   "annotation_status": "candidate_unconfirmed",
   "used_for_training": false
 }
 ```
 
 `rejected` のアノテーションは、`used_for_training=false` として扱います。YOLO export、将来のcrop export、training dataset exportでは、`used_for_training=true` のアノテーションだけを使います。これにより、human-confirmed annotationのみを学習用に使う方針を保てます。
+
+## Candidate BBox Import
+
+外部AIモデルが出力したbbox候補をCSVまたはJSONでimportできます。Open-EoEなど既存の好酸球検出モデルは、商用目的ではなく研究用の候補生成器として利用する想定です。商用利用や再配布を行う場合は、各モデル・重み・データセットのライセンスを必ず確認してください。
+
+CellposeやOpen-EoEは必須依存には含めていません。このアプリは、それらのモデルを実行するのではなく、外部で生成済みのbbox候補を読み込むだけです。
+
+CSV/JSONの必須項目:
+
+- `source_model`
+- `source_image_name`
+- `label`
+- `confidence`
+- `x_in_patch` または `x_original`
+- `y_in_patch` または `y_original`
+- `bbox_width`
+- `bbox_height`
+
+任意項目:
+
+- `patch_id`
+- `patch_x`
+- `patch_y`
+- `x_wsi`
+- `y_wsi`
+
+importされた候補は、初期状態では `annotation_status=candidate_unconfirmed`, `used_for_training=false` です。未確認候補はYOLO export、crop export、training dataset exportには使いません。人間が確認して `confirmed_by_human` または `corrected_by_human` とし、`used_for_training=true` になったannotationだけを学習用に使います。
+
+MVPでは、画面上の `Confirm all imported candidates` でimport候補を一括確認できます。個別候補ごとの承認・reject UIは今後の拡張予定です。
 
 ## YOLO変換
 
@@ -325,7 +354,7 @@ YOLO形式は次の形式で保存されます。
 class_id x_center_norm y_center_norm width_norm height_norm
 ```
 
-座標は元画像サイズで正規化されます。`ignore` ラベルは、UIのチェックボックスでYOLO出力から除外できます。さらに、YOLO出力には `used_for_training=true` のアノテーションのみが含まれます。
+座標は元画像サイズで正規化されます。patch画像の場合はpatch画像内で正規化されます。`ignore` ラベルは、UIのチェックボックスでYOLO出力から除外できます。既定では `Export used_for_training only` が有効で、YOLO出力には `used_for_training=true` のアノテーションのみが含まれます。
 
 ## YOLO学習用エクスポート
 
@@ -338,7 +367,7 @@ data/dataset/
 └── data.yaml
 ```
 
-初期設定では `reviewed` または `exported` が付いた画像だけを対象にします。これは、完全手動で確認された human-confirmed annotation のみを学習用に使うためです。`ignore` ラベルは `Exclude ignore from YOLO export` により除外できます。各画像内では `used_for_training=true` のアノテーションのみがYOLO labelへ変換されます。
+初期設定では `reviewed` または `exported` が付いた画像だけを対象にします。これは、完全手動で確認された human-confirmed annotation のみを学習用に使うためです。`ignore` ラベルは `Exclude ignore from YOLO export` により除外できます。各画像内では、既定で `used_for_training=true` のアノテーションのみがYOLO labelへ変換されます。
 
 WSI patch workflowでは、YOLO学習画像は親NDPI/WSIではなく `data/patches/images/` に保存されたpatch画像です。YOLO座標はpatch画像内で正規化されます。親WSI上の座標は `metadata.csv` と `annotations.json` に保持されます。
 
