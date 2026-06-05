@@ -10,6 +10,8 @@ data/annotations/*
 data/exports/*
 data/exports/yolo_labels/*
 data/dataset/*
+data/patches/*
+data/patches/images/*
 !data/images/.gitkeep
 !data/annotations/.gitkeep
 !data/exports/.gitkeep
@@ -20,3 +22,6 @@ data/dataset/*
 !data/dataset/labels/
 !data/dataset/images/.gitkeep
 !data/dataset/labels/.gitkeep
+!data/patches/
+!data/patches/images/
+!data/patches/images/.gitkeep

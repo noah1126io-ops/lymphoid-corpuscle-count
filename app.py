@@ -151,6 +151,10 @@ METADATA_FIELDS = [
     "patch_y",
     "patch_width",
     "patch_height",
+    "patch_level",
+    "patch_downsample",
+    "patch_level0_width",
+    "patch_level0_height",
     "target_mpp",
     "mpp_x",
     "mpp_y",
@@ -402,6 +406,10 @@ def default_image_metadata(project_template: str = "ECRS_nasal_polyp") -> dict[s
         "patch_y": "",
         "patch_width": "",
         "patch_height": "",
+        "patch_level": "",
+        "patch_downsample": "",
+        "patch_level0_width": "",
+        "patch_level0_height": "",
         "target_mpp": "",
         "mpp_x": "",
         "mpp_y": "",
@@ -611,6 +619,8 @@ def make_wsi_thumbnail(wsi_path: Path) -> tuple[Image.Image, dict[str, Any]]:
         width, height = slide.dimensions
         thumbnail = slide.get_thumbnail(WSI_THUMBNAIL_MAX_SIZE).convert("RGB")
         mpp_x, mpp_y = wsi_mpp(slide)
+        level_dimensions = [tuple(item) for item in slide.level_dimensions]
+        level_downsamples = [float(item) for item in slide.level_downsamples]
     finally:
         slide.close()
 
@@ -624,6 +634,8 @@ def make_wsi_thumbnail(wsi_path: Path) -> tuple[Image.Image, dict[str, Any]]:
         "scale_y": height / thumb_height,
         "mpp_x": mpp_x,
         "mpp_y": mpp_y,
+        "level_dimensions": level_dimensions,
+        "level_downsamples": level_downsamples,
     }
 
 
@@ -648,15 +660,34 @@ def roi_from_thumbnail_canvas(canvas_json: dict[str, Any] | None, thumbnail_info
     }
 
 
-def clamp_patch_origin(x: int, y: int, patch_size: int, wsi_width: int, wsi_height: int) -> tuple[int, int]:
+def clamp_patch_origin(x: int, y: int, patch_extent: int, wsi_width: int, wsi_height: int) -> tuple[int, int]:
     return (
-        max(0, min(x, max(0, wsi_width - patch_size))),
-        max(0, min(y, max(0, wsi_height - patch_size))),
+        max(0, min(x, max(0, wsi_width - patch_extent))),
+        max(0, min(y, max(0, wsi_height - patch_extent))),
     )
 
 
 def patch_image_path(wsi_name: str, patch_id: str) -> Path:
     return PATCH_IMAGE_DIR / f"{safe_file_stem(Path(wsi_name).stem)}_{safe_file_stem(patch_id)}.png"
+
+
+def read_wsi_region_rgb(wsi_path: Path, patch_x: int, patch_y: int, level: int, patch_size: int) -> Image.Image:
+    slide = open_wsi_slide(wsi_path)
+    try:
+        patch = slide.read_region((patch_x, patch_y), level, (patch_size, patch_size))
+    finally:
+        slide.close()
+    if patch.mode == "RGBA":
+        background = Image.new("RGBA", patch.size, (255, 255, 255, 255))
+        patch = Image.alpha_composite(background, patch)
+    return patch.convert("RGB")
+
+
+def white_fraction(image: Image.Image) -> float:
+    import numpy as np
+
+    array = np.asarray(image.convert("L"))
+    return float((array > 245).mean())
 
 
 def create_wsi_patch(
@@ -665,24 +696,24 @@ def create_wsi_patch(
     patch_x: int,
     patch_y: int,
     patch_size: int,
+    level: int,
     thumbnail_info: dict[str, Any],
     target_mpp: str,
 ) -> dict[str, Any]:
+    level_downsamples = thumbnail_info.get("level_downsamples", [1.0])
+    downsample = float(level_downsamples[level]) if level < len(level_downsamples) else 1.0
+    patch_extent = int(round(patch_size * downsample))
     patch_x, patch_y = clamp_patch_origin(
         patch_x,
         patch_y,
-        patch_size,
+        patch_extent,
         int(thumbnail_info["wsi_width"]),
         int(thumbnail_info["wsi_height"]),
     )
-    patch_id = f"patch_x{patch_x}_y{patch_y}_{patch_size}"
+    patch_id = f"patch_x{patch_x}_y{patch_y}_level{level}_{patch_size}"
     output_path = patch_image_path(wsi_name, patch_id)
     if not output_path.exists():
-        slide = open_wsi_slide(wsi_path)
-        try:
-            patch = slide.read_region((patch_x, patch_y), 0, (patch_size, patch_size)).convert("RGB")
-        finally:
-            slide.close()
+        patch = read_wsi_region_rgb(wsi_path, patch_x, patch_y, level, patch_size)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         patch.save(output_path)
 
@@ -698,6 +729,10 @@ def create_wsi_patch(
             "patch_y": patch_y,
             "patch_width": patch_size,
             "patch_height": patch_size,
+            "patch_level": level,
+            "patch_downsample": downsample,
+            "patch_level0_width": patch_extent,
+            "patch_level0_height": patch_extent,
             "target_mpp": target_mpp,
             "mpp_x": thumbnail_info.get("mpp_x", ""),
             "mpp_y": thumbnail_info.get("mpp_y", ""),
@@ -877,13 +912,16 @@ def apply_patch_coordinate_context(annotation: dict[str, Any], metadata: dict[st
     y_in_patch = safe_float(normalized.get("y_original"), safe_float(normalized.get("y")))
     if x_in_patch is None or y_in_patch is None:
         return normalized
+    patch_downsample = safe_float(metadata.get("patch_downsample"), 1.0) or 1.0
 
     normalized["x_in_patch"] = safe_round(x_in_patch)
     normalized["y_in_patch"] = safe_round(y_in_patch)
-    normalized["x_wsi"] = safe_round(patch_x + x_in_patch)
-    normalized["y_wsi"] = safe_round(patch_y + y_in_patch)
+    normalized["x_wsi"] = safe_round(patch_x + x_in_patch * patch_downsample)
+    normalized["y_wsi"] = safe_round(patch_y + y_in_patch * patch_downsample)
     normalized["patch_x"] = metadata.get("patch_x", "")
     normalized["patch_y"] = metadata.get("patch_y", "")
+    normalized["patch_level"] = metadata.get("patch_level", "")
+    normalized["patch_downsample"] = metadata.get("patch_downsample", "")
     normalized["source_wsi_name"] = metadata.get("source_wsi_name", "")
     normalized["patch_id"] = metadata.get("patch_id", "")
     return normalized
@@ -1623,6 +1661,10 @@ def render_project_template() -> str:
             "patch_y",
             "patch_width",
             "patch_height",
+            "patch_level",
+            "patch_downsample",
+            "patch_level0_width",
+            "patch_level0_height",
             "target_mpp",
             "mpp_x",
             "mpp_y",
@@ -1720,6 +1762,10 @@ def render_metadata_inputs(project_template: str) -> dict[str, Any]:
         "patch_y": st.sidebar.text_input("patch_y", value=str(current.get("patch_y", ""))),
         "patch_width": st.sidebar.text_input("patch_width", value=str(current.get("patch_width", ""))),
         "patch_height": st.sidebar.text_input("patch_height", value=str(current.get("patch_height", ""))),
+        "patch_level": st.sidebar.text_input("patch_level", value=str(current.get("patch_level", ""))),
+        "patch_downsample": st.sidebar.text_input("patch_downsample", value=str(current.get("patch_downsample", ""))),
+        "patch_level0_width": st.sidebar.text_input("patch_level0_width", value=str(current.get("patch_level0_width", ""))),
+        "patch_level0_height": st.sidebar.text_input("patch_level0_height", value=str(current.get("patch_level0_height", ""))),
         "target_mpp": st.sidebar.text_input("target_mpp", value=str(current.get("target_mpp", ""))),
         "mpp_x": st.sidebar.text_input("mpp_x", value=str(current.get("mpp_x", ""))),
         "mpp_y": st.sidebar.text_input("mpp_y", value=str(current.get("mpp_y", ""))),
@@ -1902,11 +1948,27 @@ def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
         f"mpp: {thumbnail_info.get('mpp_x', '')}, {thumbnail_info.get('mpp_y', '')}"
     )
 
-    controls = st.columns(4)
-    patch_size = controls[0].selectbox("patchサイズ", PATCH_SIZE_OPTIONS, index=0)
-    target_mpp = controls[1].text_input("target_mpp", value=str(thumbnail_info.get("mpp_x") or ""))
-    manual_x = controls[2].number_input("patch_x", min_value=0, value=0, step=256)
-    manual_y = controls[3].number_input("patch_y", min_value=0, value=0, step=256)
+    level_dimensions = thumbnail_info.get("level_dimensions", [(thumbnail_info["wsi_width"], thumbnail_info["wsi_height"])])
+    level_downsamples = thumbnail_info.get("level_downsamples", [1.0])
+    level_options = list(range(len(level_dimensions)))
+
+    controls = st.columns(3)
+    patch_size = controls[0].selectbox("表示/保存するpatchサイズ", PATCH_SIZE_OPTIONS, index=0)
+    level = controls[1].selectbox(
+        "拡大率 level",
+        level_options,
+        index=0,
+        format_func=lambda item: (
+            f"level {item} "
+            f"(downsample {level_downsamples[item]:.1f}, {level_dimensions[item][0]}x{level_dimensions[item][1]})"
+        ),
+    )
+    target_mpp = controls[2].text_input("target_mpp", value=str(thumbnail_info.get("mpp_x") or ""))
+
+    patch_downsample = float(level_downsamples[level])
+    patch_extent = int(round(patch_size * patch_downsample))
+    max_x = max(0, int(thumbnail_info["wsi_width"]) - patch_extent)
+    max_y = max(0, int(thumbnail_info["wsi_height"]) - patch_extent)
 
     roi_canvas = st_canvas(
         fill_color="rgba(255, 255, 255, 0.15)",
@@ -1922,18 +1984,53 @@ def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
 
     selected_roi = roi_from_thumbnail_canvas(roi_canvas.json_data, thumbnail_info)
     if selected_roi:
-        patch_x = selected_roi["x"]
-        patch_y = selected_roi["y"]
+        default_x = min(selected_roi["x"], max_x)
+        default_y = min(selected_roi["y"], max_y)
         st.info(
-            f"選択ROIの左上座標: x={patch_x}, y={patch_y}。"
-            f"{patch_size} x {patch_size} px のpatchを作成します。"
+            f"thumbnailで選択したROI候補: x={default_x}, y={default_y}。"
+            "下の座標を動かすと、切り出し前にプレビューできます。"
         )
     else:
-        patch_x = int(manual_x)
-        patch_y = int(manual_y)
-        st.info("ROI矩形が未選択です。手入力の patch_x / patch_y を使用します。")
+        default_x = min(max_x, int(safe_float(st.session_state.image_metadata.get("patch_x"), 0) or 0))
+        default_y = min(max_y, int(safe_float(st.session_state.image_metadata.get("patch_y"), 0) or 0))
+        st.info("ROI矩形を選ぶか、下のpatch_x / patch_yを直接調整してください。")
 
-    if st.button("WSI ROIからpatchを作成", use_container_width=True):
+    xy_controls = st.columns(2)
+    patch_x = int(
+        xy_controls[0].number_input(
+            "patch_x（WSI level 0 左上X）",
+            min_value=0,
+            max_value=max_x,
+            value=default_x,
+            step=max(1, patch_extent // 4),
+        )
+    )
+    patch_y = int(
+        xy_controls[1].number_input(
+            "patch_y（WSI level 0 左上Y）",
+            min_value=0,
+            max_value=max_y,
+            value=default_y,
+            step=max(1, patch_extent // 4),
+        )
+    )
+
+    preview = read_wsi_region_rgb(wsi_path, patch_x, patch_y, level, int(patch_size))
+    st.image(
+        preview,
+        caption=(
+            f"patchプレビュー: x={patch_x}, y={patch_y}, level={level}, "
+            f"downsample={patch_downsample:.2f}, level0範囲={patch_extent}x{patch_extent}"
+        ),
+        use_container_width=True,
+    )
+    if white_fraction(preview) > 0.95:
+        st.warning(
+            "このpatchプレビューはほぼ白背景です。patch_x / patch_y または level を調整して、"
+            "組織が見える位置を選んでください。"
+        )
+
+    if st.button("このプレビューをアノテーション用patchとして確定", use_container_width=True):
         existing_metadata = st.session_state.image_metadata.copy()
         patch = create_wsi_patch(
             wsi_path=wsi_path,
@@ -1941,6 +2038,7 @@ def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
             patch_x=int(patch_x),
             patch_y=int(patch_y),
             patch_size=int(patch_size),
+            level=int(level),
             thumbnail_info=thumbnail_info,
             target_mpp=target_mpp,
         )
