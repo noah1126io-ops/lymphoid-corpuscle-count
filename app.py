@@ -3,9 +3,13 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import threading
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 import streamlit as st
@@ -302,7 +306,11 @@ NDPI_EXTENSIONS = {".ndpi"}
 WSI_EXTENSIONS = {".ndpi", ".svs", ".scn", ".vms", ".vmu"}
 MAX_NDPI_CONVERSION_PIXELS = 30_000_000
 WSI_THUMBNAIL_MAX_SIZE = (1100, 700)
-PATCH_SIZE_OPTIONS = [1024, 2048]
+PATCH_DIMENSION_OPTIONS = [512, 1024, 1536, 2048]
+WSI_TILE_SIZE = 256
+WSI_TILE_SERVER_PORT = 8765
+WSI_TILE_SOURCES: dict[str, Path] = {}
+WSI_TILE_SERVER_STARTED = False
 
 # Research TIFF files can be very large. The app still downscales for display,
 # but Pillow needs permission to open the original dimensions first.
@@ -639,6 +647,83 @@ def make_wsi_thumbnail(wsi_path: Path) -> tuple[Image.Image, dict[str, Any]]:
     }
 
 
+class WSITileRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path != "/tile":
+            self.send_error(404)
+            return
+
+        params = parse_qs(parsed.query)
+        source_id = params.get("id", [""])[0]
+        wsi_path = WSI_TILE_SOURCES.get(source_id)
+        if not wsi_path:
+            self.send_error(404)
+            return
+
+        try:
+            level = int(params.get("level", ["0"])[0])
+            tile_x = int(params.get("x", ["0"])[0])
+            tile_y = int(params.get("y", ["0"])[0])
+            tile_size = int(params.get("size", [str(WSI_TILE_SIZE)])[0])
+            slide = open_wsi_slide(wsi_path)
+            try:
+                downsample = float(slide.level_downsamples[level])
+                level_width, level_height = slide.level_dimensions[level]
+                level_left = tile_x * tile_size
+                level_top = tile_y * tile_size
+                read_width = min(tile_size, max(1, level_width - level_left))
+                read_height = min(tile_size, max(1, level_height - level_top))
+                location = (int(level_left * downsample), int(level_top * downsample))
+                tile = slide.read_region(location, level, (read_width, read_height))
+            finally:
+                slide.close()
+
+            if tile.mode == "RGBA":
+                background = Image.new("RGBA", tile.size, (255, 255, 255, 255))
+                tile = Image.alpha_composite(background, tile)
+            tile = tile.convert("RGB")
+            output = BytesIO()
+            tile.save(output, format="JPEG", quality=85)
+            payload = output.getvalue()
+        except Exception:
+            self.send_error(500)
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        return
+
+
+def ensure_wsi_tile_server() -> None:
+    global WSI_TILE_SERVER_STARTED
+    if WSI_TILE_SERVER_STARTED:
+        return
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", WSI_TILE_SERVER_PORT), WSITileRequestHandler)
+    except OSError as error:
+        raise RuntimeError(
+            f"WSIタイルビューア用ポート {WSI_TILE_SERVER_PORT} を開始できませんでした。"
+            "別のStreamlitプロセスを終了してから再実行してください。"
+        ) from error
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    WSI_TILE_SERVER_STARTED = True
+
+
+def register_wsi_tile_source(wsi_path: Path) -> str:
+    ensure_wsi_tile_server()
+    source_id = safe_file_stem(f"{wsi_path.stem}_{wsi_path.stat().st_size}_{int(wsi_path.stat().st_mtime)}")
+    WSI_TILE_SOURCES[source_id] = wsi_path
+    return source_id
+
+
 def roi_from_thumbnail_canvas(canvas_json: dict[str, Any] | None, thumbnail_info: dict[str, Any]) -> dict[str, int] | None:
     if not canvas_json:
         return None
@@ -660,10 +745,17 @@ def roi_from_thumbnail_canvas(canvas_json: dict[str, Any] | None, thumbnail_info
     }
 
 
-def clamp_patch_origin(x: int, y: int, patch_extent: int, wsi_width: int, wsi_height: int) -> tuple[int, int]:
+def clamp_patch_origin(
+    x: int,
+    y: int,
+    patch_level0_width: int,
+    patch_level0_height: int,
+    wsi_width: int,
+    wsi_height: int,
+) -> tuple[int, int]:
     return (
-        max(0, min(x, max(0, wsi_width - patch_extent))),
-        max(0, min(y, max(0, wsi_height - patch_extent))),
+        max(0, min(x, max(0, wsi_width - patch_level0_width))),
+        max(0, min(y, max(0, wsi_height - patch_level0_height))),
     )
 
 
@@ -671,10 +763,17 @@ def patch_image_path(wsi_name: str, patch_id: str) -> Path:
     return PATCH_IMAGE_DIR / f"{safe_file_stem(Path(wsi_name).stem)}_{safe_file_stem(patch_id)}.png"
 
 
-def read_wsi_region_rgb(wsi_path: Path, patch_x: int, patch_y: int, level: int, patch_size: int) -> Image.Image:
+def read_wsi_region_rgb(
+    wsi_path: Path,
+    patch_x: int,
+    patch_y: int,
+    level: int,
+    patch_width: int,
+    patch_height: int,
+) -> Image.Image:
     slide = open_wsi_slide(wsi_path)
     try:
-        patch = slide.read_region((patch_x, patch_y), level, (patch_size, patch_size))
+        patch = slide.read_region((patch_x, patch_y), level, (patch_width, patch_height))
     finally:
         slide.close()
     if patch.mode == "RGBA":
@@ -690,30 +789,222 @@ def white_fraction(image: Image.Image) -> float:
     return float((array > 245).mean())
 
 
+def render_wsi_scroll_viewer(
+    wsi_path: Path,
+    thumbnail_info: dict[str, Any],
+    initial_level: int,
+    patch_width: int,
+    patch_height: int,
+) -> None:
+    source_id = register_wsi_tile_source(wsi_path)
+    level_dimensions = thumbnail_info.get("level_dimensions", [])
+    level_downsamples = thumbnail_info.get("level_downsamples", [])
+    viewer_payload = {
+        "tileUrl": f"http://127.0.0.1:{WSI_TILE_SERVER_PORT}/tile",
+        "sourceId": source_id,
+        "tileSize": WSI_TILE_SIZE,
+        "levelDimensions": level_dimensions,
+        "levelDownsamples": level_downsamples,
+        "initialLevel": initial_level,
+        "patchWidth": patch_width,
+        "patchHeight": patch_height,
+    }
+    components.html(
+        f"""
+        <div style="font-family: sans-serif;">
+          <div style="display:flex; gap:8px; align-items:center; margin-bottom:6px;">
+            <button id="zoomIn">拡大</button>
+            <button id="zoomOut">縮小</button>
+            <button id="copyCoords">patch座標をコピー</button>
+            <span id="coordText" style="font-size:13px;"></span>
+          </div>
+          <canvas id="wsiCanvas" width="980" height="560"
+            style="width:100%; max-width:980px; height:560px; border:1px solid #d1d5db; background:#f9fafb; cursor:grab;">
+          </canvas>
+          <div style="font-size:12px; color:#4b5563; margin-top:4px;">
+            マウスホイールでズーム、ドラッグで移動します。赤枠が保存予定patchの範囲です。
+            表示されたpatch_x / patch_yをコピーして、下の入力欄に貼り付けてください。
+          </div>
+        </div>
+        <script>
+        const cfg = {json.dumps(viewer_payload)};
+        const canvas = document.getElementById("wsiCanvas");
+        const ctx = canvas.getContext("2d");
+        const coordText = document.getElementById("coordText");
+        const tileCache = new Map();
+        let level = Math.min(cfg.initialLevel, cfg.levelDimensions.length - 1);
+        let dims = cfg.levelDimensions[level];
+        let downsample = cfg.levelDownsamples[level] || 1;
+        let centerX = dims[0] / 2;
+        let centerY = dims[1] / 2;
+        let scale = Math.min(canvas.width / dims[0], canvas.height / dims[1]);
+        let dragging = false;
+        let lastX = 0;
+        let lastY = 0;
+
+        function setLevel(newLevel) {{
+          newLevel = Math.max(0, Math.min(cfg.levelDimensions.length - 1, newLevel));
+          if (newLevel === level) return;
+          const center0X = centerX * downsample;
+          const center0Y = centerY * downsample;
+          level = newLevel;
+          dims = cfg.levelDimensions[level];
+          downsample = cfg.levelDownsamples[level] || 1;
+          centerX = center0X / downsample;
+          centerY = center0Y / downsample;
+          scale = Math.min(Math.max(scale, 0.15), 6);
+          draw();
+        }}
+
+        function clampCenter() {{
+          const halfW = canvas.width / (2 * scale);
+          const halfH = canvas.height / (2 * scale);
+          centerX = Math.max(halfW, Math.min(dims[0] - halfW, centerX));
+          centerY = Math.max(halfH, Math.min(dims[1] - halfH, centerY));
+        }}
+
+        function tileKey(z, x, y) {{
+          return `${{z}}/${{x}}/${{y}}`;
+        }}
+
+        function loadTile(z, x, y) {{
+          const key = tileKey(z, x, y);
+          if (tileCache.has(key)) return tileCache.get(key);
+          const img = new Image();
+          img.crossOrigin = "anonymous";
+          img.src = `${{cfg.tileUrl}}?id=${{encodeURIComponent(cfg.sourceId)}}&level=${{z}}&x=${{x}}&y=${{y}}&size=${{cfg.tileSize}}`;
+          img.onload = draw;
+          tileCache.set(key, img);
+          return img;
+        }}
+
+        function currentPatchCoords() {{
+          const x = Math.max(0, Math.round((centerX - cfg.patchWidth / 2) * downsample));
+          const y = Math.max(0, Math.round((centerY - cfg.patchHeight / 2) * downsample));
+          const w = Math.round(cfg.patchWidth * downsample);
+          const h = Math.round(cfg.patchHeight * downsample);
+          return {{ x, y, w, h }};
+        }}
+
+        function updateCoords() {{
+          const p = currentPatchCoords();
+          coordText.textContent = `level=${{level}}, downsample=${{downsample.toFixed(2)}}, patch_x=${{p.x}}, patch_y=${{p.y}}, level0範囲=${{p.w}}x${{p.h}}`;
+        }}
+
+        function draw() {{
+          clampCenter();
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          ctx.fillStyle = "#f9fafb";
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+          const viewLeft = centerX - canvas.width / (2 * scale);
+          const viewTop = centerY - canvas.height / (2 * scale);
+          const startTileX = Math.max(0, Math.floor(viewLeft / cfg.tileSize));
+          const startTileY = Math.max(0, Math.floor(viewTop / cfg.tileSize));
+          const endTileX = Math.ceil((viewLeft + canvas.width / scale) / cfg.tileSize);
+          const endTileY = Math.ceil((viewTop + canvas.height / scale) / cfg.tileSize);
+
+          for (let ty = startTileY; ty <= endTileY; ty++) {{
+            for (let tx = startTileX; tx <= endTileX; tx++) {{
+              const img = loadTile(level, tx, ty);
+              const sx = (tx * cfg.tileSize - viewLeft) * scale;
+              const sy = (ty * cfg.tileSize - viewTop) * scale;
+              const sw = cfg.tileSize * scale;
+              const sh = cfg.tileSize * scale;
+              if (img.complete && img.naturalWidth > 0) {{
+                ctx.drawImage(img, sx, sy, sw, sh);
+              }}
+            }}
+          }}
+
+          const rectW = cfg.patchWidth * scale;
+          const rectH = cfg.patchHeight * scale;
+          ctx.strokeStyle = "#ff2d55";
+          ctx.lineWidth = 3;
+          ctx.strokeRect((canvas.width - rectW) / 2, (canvas.height - rectH) / 2, rectW, rectH);
+          ctx.fillStyle = "rgba(255,45,85,0.08)";
+          ctx.fillRect((canvas.width - rectW) / 2, (canvas.height - rectH) / 2, rectW, rectH);
+          updateCoords();
+        }}
+
+        canvas.addEventListener("mousedown", (event) => {{
+          dragging = true;
+          lastX = event.clientX;
+          lastY = event.clientY;
+          canvas.style.cursor = "grabbing";
+        }});
+        window.addEventListener("mouseup", () => {{
+          dragging = false;
+          canvas.style.cursor = "grab";
+        }});
+        canvas.addEventListener("mousemove", (event) => {{
+          if (!dragging) return;
+          centerX -= (event.clientX - lastX) / scale;
+          centerY -= (event.clientY - lastY) / scale;
+          lastX = event.clientX;
+          lastY = event.clientY;
+          draw();
+        }});
+        canvas.addEventListener("wheel", (event) => {{
+          event.preventDefault();
+          const oldScale = scale;
+          const factor = event.deltaY < 0 ? 1.2 : 1 / 1.2;
+          scale *= factor;
+          if (scale > 2.8 && level > 0) {{
+            scale = oldScale;
+            setLevel(level - 1);
+          }} else if (scale < 0.25 && level < cfg.levelDimensions.length - 1) {{
+            scale = oldScale;
+            setLevel(level + 1);
+          }}
+          draw();
+        }}, {{ passive: false }});
+        document.getElementById("zoomIn").onclick = () => setLevel(level - 1);
+        document.getElementById("zoomOut").onclick = () => setLevel(level + 1);
+        document.getElementById("copyCoords").onclick = async () => {{
+          const p = currentPatchCoords();
+          const text = `patch_x=${{p.x}}, patch_y=${{p.y}}, level=${{level}}`;
+          try {{
+            await navigator.clipboard.writeText(`${{p.x}},${{p.y}},${{level}}`);
+            coordText.textContent = `${{text}} をコピーしました`;
+          }} catch (error) {{
+            coordText.textContent = text;
+          }}
+        }};
+        draw();
+        </script>
+        """,
+        height=650,
+    )
+
+
 def create_wsi_patch(
     wsi_path: Path,
     wsi_name: str,
     patch_x: int,
     patch_y: int,
-    patch_size: int,
+    patch_width: int,
+    patch_height: int,
     level: int,
     thumbnail_info: dict[str, Any],
     target_mpp: str,
 ) -> dict[str, Any]:
     level_downsamples = thumbnail_info.get("level_downsamples", [1.0])
     downsample = float(level_downsamples[level]) if level < len(level_downsamples) else 1.0
-    patch_extent = int(round(patch_size * downsample))
+    patch_level0_width = int(round(patch_width * downsample))
+    patch_level0_height = int(round(patch_height * downsample))
     patch_x, patch_y = clamp_patch_origin(
         patch_x,
         patch_y,
-        patch_extent,
+        patch_level0_width,
+        patch_level0_height,
         int(thumbnail_info["wsi_width"]),
         int(thumbnail_info["wsi_height"]),
     )
-    patch_id = f"patch_x{patch_x}_y{patch_y}_level{level}_{patch_size}"
+    patch_id = f"patch_x{patch_x}_y{patch_y}_level{level}_{patch_width}x{patch_height}"
     output_path = patch_image_path(wsi_name, patch_id)
     if not output_path.exists():
-        patch = read_wsi_region_rgb(wsi_path, patch_x, patch_y, level, patch_size)
+        patch = read_wsi_region_rgb(wsi_path, patch_x, patch_y, level, patch_width, patch_height)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         patch.save(output_path)
 
@@ -727,12 +1018,12 @@ def create_wsi_patch(
             "patch_id": patch_id,
             "patch_x": patch_x,
             "patch_y": patch_y,
-            "patch_width": patch_size,
-            "patch_height": patch_size,
+            "patch_width": patch_width,
+            "patch_height": patch_height,
             "patch_level": level,
             "patch_downsample": downsample,
-            "patch_level0_width": patch_extent,
-            "patch_level0_height": patch_extent,
+            "patch_level0_width": patch_level0_width,
+            "patch_level0_height": patch_level0_height,
             "target_mpp": target_mpp,
             "mpp_x": thumbnail_info.get("mpp_x", ""),
             "mpp_y": thumbnail_info.get("mpp_y", ""),
@@ -1937,9 +2228,9 @@ def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
         apply_patch_metadata_to_session(active_patch.get("patch_metadata", {}))
         return active_patch
 
-    st.subheader("WSI ROIパッチ作成")
+    st.subheader("WSIビューア / ROIパッチ作成")
     st.caption(
-        "低倍率thumbnail上で矩形ROIを選び、アノテーション用patchを作成します。"
+        "上のビューアでマウスホイールズームとドラッグ移動を行い、学習に使いたい場所を探します。"
         "巨大WSI全体はannotation canvasに直接載せません。"
     )
     st.caption(
@@ -1952,9 +2243,10 @@ def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
     level_downsamples = thumbnail_info.get("level_downsamples", [1.0])
     level_options = list(range(len(level_dimensions)))
 
-    controls = st.columns(3)
-    patch_size = controls[0].selectbox("表示/保存するpatchサイズ", PATCH_SIZE_OPTIONS, index=0)
-    level = controls[1].selectbox(
+    controls = st.columns(4)
+    patch_width = controls[0].number_input("patch幅", min_value=256, max_value=4096, value=1024, step=256)
+    patch_height = controls[1].number_input("patch高さ", min_value=256, max_value=4096, value=1024, step=256)
+    level = controls[2].selectbox(
         "拡大率 level",
         level_options,
         index=0,
@@ -1963,13 +2255,20 @@ def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
             f"(downsample {level_downsamples[item]:.1f}, {level_dimensions[item][0]}x{level_dimensions[item][1]})"
         ),
     )
-    target_mpp = controls[2].text_input("target_mpp", value=str(thumbnail_info.get("mpp_x") or ""))
+    target_mpp = controls[3].text_input("target_mpp", value=str(thumbnail_info.get("mpp_x") or ""))
 
     patch_downsample = float(level_downsamples[level])
-    patch_extent = int(round(patch_size * patch_downsample))
-    max_x = max(0, int(thumbnail_info["wsi_width"]) - patch_extent)
-    max_y = max(0, int(thumbnail_info["wsi_height"]) - patch_extent)
+    patch_level0_width = int(round(int(patch_width) * patch_downsample))
+    patch_level0_height = int(round(int(patch_height) * patch_downsample))
+    max_x = max(0, int(thumbnail_info["wsi_width"]) - patch_level0_width)
+    max_y = max(0, int(thumbnail_info["wsi_height"]) - patch_level0_height)
 
+    try:
+        render_wsi_scroll_viewer(wsi_path, thumbnail_info, int(level), int(patch_width), int(patch_height))
+    except RuntimeError as error:
+        st.error(str(error))
+
+    st.caption("低倍率thumbnailで大まかなROI候補を選ぶこともできます。細かい位置決めは上のビューアで確認してください。")
     roi_canvas = st_canvas(
         fill_color="rgba(255, 255, 255, 0.15)",
         stroke_width=3,
@@ -2002,7 +2301,7 @@ def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
             min_value=0,
             max_value=max_x,
             value=default_x,
-            step=max(1, patch_extent // 4),
+            step=max(1, patch_level0_width // 4),
         )
     )
     patch_y = int(
@@ -2011,16 +2310,16 @@ def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
             min_value=0,
             max_value=max_y,
             value=default_y,
-            step=max(1, patch_extent // 4),
+            step=max(1, patch_level0_height // 4),
         )
     )
 
-    preview = read_wsi_region_rgb(wsi_path, patch_x, patch_y, level, int(patch_size))
+    preview = read_wsi_region_rgb(wsi_path, patch_x, patch_y, level, int(patch_width), int(patch_height))
     st.image(
         preview,
         caption=(
             f"patchプレビュー: x={patch_x}, y={patch_y}, level={level}, "
-            f"downsample={patch_downsample:.2f}, level0範囲={patch_extent}x{patch_extent}"
+            f"downsample={patch_downsample:.2f}, level0範囲={patch_level0_width}x{patch_level0_height}"
         ),
         use_container_width=True,
     )
@@ -2037,7 +2336,8 @@ def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
             wsi_name=uploaded_image.name,
             patch_x=int(patch_x),
             patch_y=int(patch_y),
-            patch_size=int(patch_size),
+            patch_width=int(patch_width),
+            patch_height=int(patch_height),
             level=int(level),
             thumbnail_info=thumbnail_info,
             target_mpp=target_mpp,
