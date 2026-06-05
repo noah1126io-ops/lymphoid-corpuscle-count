@@ -1,2 +1,7 @@
 [server]
 maxUploadSize = 2048
+headless = true
+showEmailPrompt = false
+
+[browser]
+gatherUsageStats = false

@@ -2140,6 +2140,7 @@ def render_sidebar() -> tuple[
     if upload_limit < 2048:
         st.sidebar.warning(
             "アップロード上限が200MB付近のままです。run_app.bat または run_app.ps1 から起動してください。"
+            "初回Email入力プロンプトを避けるため、起動スクリプトを使うのが確実です。"
         )
     uploaded_image = st.sidebar.file_uploader(
         "組織画像をアップロード",
