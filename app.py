@@ -17,7 +17,7 @@ from streamlit.elements.lib.layout_utils import LayoutConfig
 from streamlit_drawable_canvas import st_canvas
 
 
-APP_TITLE = "Manual Granulocyte Annotation Tool"
+APP_TITLE = "手動好酸球アノテーションツール"
 
 PROJECT_TEMPLATES = [
     "ECRS_nasal_polyp",
@@ -526,8 +526,8 @@ def convert_ndpi_to_ome_tiff(ndpi_path: Path, output_path: Path) -> dict[str, An
         import tifffile
     except ImportError as error:
         raise RuntimeError(
-            "NDPI conversion requires openslide-python, openslide-bin, tifffile, and numpy. "
-            "Run: pip install -r requirements.txt"
+            "NDPI変換には openslide-python, openslide-bin, tifffile, numpy が必要です。"
+            "次を実行してください: pip install -r requirements.txt"
         ) from error
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -587,8 +587,8 @@ def open_wsi_slide(wsi_path: Path) -> Any:
         import openslide
     except ImportError as error:
         raise RuntimeError(
-            "WSI patch creation requires openslide-python and openslide-bin. "
-            "Run: pip install -r requirements.txt"
+            "WSI patch作成には openslide-python と openslide-bin が必要です。"
+            "次を実行してください: pip install -r requirements.txt"
         ) from error
     return openslide.OpenSlide(str(wsi_path))
 
@@ -1601,10 +1601,10 @@ def missing_required_metadata(metadata: dict[str, Any]) -> list[str]:
 
 
 def render_project_template() -> str:
-    st.sidebar.subheader("Project Template")
+    st.sidebar.subheader("プロジェクトテンプレート")
     current_template = st.session_state.project_template
     project_template = st.sidebar.selectbox(
-        "project_template",
+        "project_template（保存値）",
         PROJECT_TEMPLATES,
         index=select_index(PROJECT_TEMPLATES, current_template, "ECRS_nasal_polyp"),
     )
@@ -1636,38 +1636,38 @@ def render_project_template() -> str:
 
 
 def render_metadata_inputs(project_template: str) -> dict[str, Any]:
-    st.sidebar.subheader("Image Metadata")
+    st.sidebar.subheader("画像メタデータ")
     current = st.session_state.image_metadata
     current["project_template"] = project_template
 
     metadata = {
         "project_template": project_template,
         "disease_context": st.sidebar.text_input(
-            "disease_context *",
+            "疾患・研究背景 disease_context *",
             value=str(current.get("disease_context", "unknown")),
         ),
         "source_organ": st.sidebar.selectbox(
-            "source_organ",
+            "由来臓器 source_organ",
             SOURCE_ORGANS,
             index=select_index(SOURCE_ORGANS, current.get("source_organ"), "unknown"),
         ),
         "tissue_type": st.sidebar.selectbox(
-            "tissue_type *",
+            "組織種 tissue_type *",
             TISSUE_TYPES,
             index=select_index(TISSUE_TYPES, current.get("tissue_type"), "unknown"),
         ),
         "tissue_region": st.sidebar.selectbox(
-            "tissue_region",
+            "組織領域 tissue_region",
             TISSUE_REGIONS,
             index=select_index(TISSUE_REGIONS, current.get("tissue_region"), "unknown"),
         ),
         "staining": st.sidebar.selectbox(
-            "staining *",
+            "染色 staining *",
             STAINING_OPTIONS,
             index=select_index(STAINING_OPTIONS, current.get("staining"), "unknown"),
         ),
         "objective_magnification": st.sidebar.selectbox(
-            "objective_magnification *",
+            "対物倍率 objective_magnification *",
             OBJECTIVE_MAGNIFICATIONS,
             index=select_index(
                 OBJECTIVE_MAGNIFICATIONS,
@@ -1675,46 +1675,46 @@ def render_metadata_inputs(project_template: str) -> dict[str, Any]:
                 "unknown",
             ),
         ),
-        "specimen_id": st.sidebar.text_input("specimen_id *", value=str(current.get("specimen_id", ""))),
-        "slide_id": st.sidebar.text_input("slide_id *", value=str(current.get("slide_id", ""))),
-        "annotator": st.sidebar.text_input("annotator *", value=str(current.get("annotator", ""))),
-        "patient_id_hash": st.sidebar.text_input("patient_id_hash", value=str(current.get("patient_id_hash", ""))),
+        "specimen_id": st.sidebar.text_input("標本ID specimen_id *", value=str(current.get("specimen_id", ""))),
+        "slide_id": st.sidebar.text_input("スライドID slide_id *", value=str(current.get("slide_id", ""))),
+        "annotator": st.sidebar.text_input("アノテーター annotator *", value=str(current.get("annotator", ""))),
+        "patient_id_hash": st.sidebar.text_input("匿名化患者ID patient_id_hash", value=str(current.get("patient_id_hash", ""))),
         "anatomical_site": st.sidebar.selectbox(
-            "anatomical_site",
+            "採取部位 anatomical_site",
             ANATOMICAL_SITES,
             index=select_index(ANATOMICAL_SITES, current.get("anatomical_site"), "unknown"),
         ),
         "scanner_or_microscope": st.sidebar.text_input(
-            "scanner_or_microscope",
+            "スキャナ/顕微鏡 scanner_or_microscope",
             value=str(current.get("scanner_or_microscope", "")),
         ),
-        "pixel_size_um": st.sidebar.text_input("pixel_size_um", value=str(current.get("pixel_size_um", ""))),
-        "hpf_area_mm2": st.sidebar.text_input("hpf_area_mm2", value=str(current.get("hpf_area_mm2", ""))),
+        "pixel_size_um": st.sidebar.text_input("pixel_size_um（um/px）", value=str(current.get("pixel_size_um", ""))),
+        "hpf_area_mm2": st.sidebar.text_input("hpf_area_mm2（mm2）", value=str(current.get("hpf_area_mm2", ""))),
         "hpf_diameter_mm": st.sidebar.text_input(
-            "hpf_diameter_mm",
+            "hpf_diameter_mm（mm）",
             value=str(current.get("hpf_diameter_mm", "")),
         ),
         "image_is_single_hpf": st.sidebar.checkbox(
-            "Image is exactly 1 HPF",
+            "画像全体を1 HPFとして扱う",
             value=bool(current.get("image_is_single_hpf", False)),
-            help="Use only when the whole image represents exactly one high-power field.",
+            help="画像全体がちょうど1 high-power fieldを表す場合のみ有効にしてください。",
         ),
         "section_quality": st.sidebar.selectbox(
-            "section_quality",
+            "切片/画像品質 section_quality",
             SECTION_QUALITY_OPTIONS,
             index=select_index(SECTION_QUALITY_OPTIONS, current.get("section_quality"), "good"),
         ),
         "reviewed": st.sidebar.checkbox(
-            "reviewed",
+            "確認済み reviewed",
             value=bool(current.get("reviewed", False)),
-            help="Mark this image as human-confirmed for training export.",
+            help="人が確認済みで、学習用export候補にできる画像として扱います。",
         ),
         "exported": st.sidebar.checkbox(
-            "exported",
+            "export対象 exported",
             value=bool(current.get("exported", False)),
-            help="Mark this image as eligible for dataset export.",
+            help="dataset export対象として扱います。",
         ),
-        "source_wsi_name": st.sidebar.text_input("source_wsi_name", value=str(current.get("source_wsi_name", ""))),
+        "source_wsi_name": st.sidebar.text_input("親WSI名 source_wsi_name", value=str(current.get("source_wsi_name", ""))),
         "patch_id": st.sidebar.text_input("patch_id", value=str(current.get("patch_id", ""))),
         "patch_x": st.sidebar.text_input("patch_x", value=str(current.get("patch_x", ""))),
         "patch_y": st.sidebar.text_input("patch_y", value=str(current.get("patch_y", ""))),
@@ -1723,17 +1723,17 @@ def render_metadata_inputs(project_template: str) -> dict[str, Any]:
         "target_mpp": st.sidebar.text_input("target_mpp", value=str(current.get("target_mpp", ""))),
         "mpp_x": st.sidebar.text_input("mpp_x", value=str(current.get("mpp_x", ""))),
         "mpp_y": st.sidebar.text_input("mpp_y", value=str(current.get("mpp_y", ""))),
-        "notes": st.sidebar.text_area("notes", value=str(current.get("notes", "")), height=80),
+        "notes": st.sidebar.text_area("メモ notes", value=str(current.get("notes", "")), height=80),
     }
     st.session_state.image_metadata = metadata
     return metadata
 
 
 def render_region_type() -> dict[str, Any]:
-    st.sidebar.subheader("Region Type")
+    st.sidebar.subheader("領域タイプ")
     current_region = st.session_state.region_annotations.get("global_region_type", "unknown")
     region_type = st.sidebar.selectbox(
-        "global_region_type",
+        "画像全体の領域 global_region_type",
         REGION_TYPES,
         index=select_index(REGION_TYPES, current_region, "unknown"),
     )
@@ -1746,27 +1746,27 @@ def render_region_type() -> dict[str, Any]:
 
 
 def render_label_controls() -> tuple[str, str, str, int]:
-    st.sidebar.subheader("Active Label")
+    st.sidebar.subheader("現在のラベル")
     quick_label = st.sidebar.radio(
-        "Common labels",
+        "よく使うラベル",
         PRIMARY_LABELS,
         captions=[LABEL_COLORS[label] for label in PRIMARY_LABELS],
     )
     active_label = st.sidebar.selectbox(
-        "All labels",
+        "全ラベル",
         LABELS,
         index=LABELS.index(quick_label),
-        help="Initial ECRS evaluation focuses on eosinophil vs other/ignore.",
+        help="初期評価では eosinophil と other/ignore の区別を主対象にします。",
     )
 
-    st.sidebar.subheader("Drawing Mode")
+    st.sidebar.subheader("描画モード")
     drawing_mode = st.sidebar.selectbox(
-        "drawing_mode",
+        "drawing_mode（描画/編集）",
         ["circle", "rect", "transform"],
         index=0,
-        help="Use transform to move, resize, or delete selected objects.",
+        help="transformでは選択した図形の移動、サイズ変更、削除ができます。",
     )
-    stroke_width = st.sidebar.slider("Stroke width", min_value=1, max_value=8, value=3)
+    stroke_width = st.sidebar.slider("線の太さ", min_value=1, max_value=8, value=3)
     return active_label, drawing_mode, LABEL_COLORS[active_label], stroke_width
 
 
@@ -1797,9 +1797,9 @@ def render_sidebar() -> tuple[
     bool,
     bool,
 ]:
-    st.sidebar.subheader("Upload tissue image")
+    st.sidebar.subheader("画像アップロード")
     uploaded_image = st.sidebar.file_uploader(
-        "Upload tissue image",
+        "組織画像をアップロード",
         type=["jpg", "jpeg", "png", "tif", "tiff", "ndpi", "svs", "scn", "vms", "vmu"],
     )
     if uploaded_image and st.session_state.uploaded_source_name != uploaded_image.name:
@@ -1811,30 +1811,30 @@ def render_sidebar() -> tuple[
     region_annotations = render_region_type()
     active_label, drawing_mode, stroke_color, stroke_width = render_label_controls()
 
-    st.sidebar.subheader("Export Settings")
+    st.sidebar.subheader("エクスポート設定")
     objective_filter = st.sidebar.selectbox(
-        "objective_magnification filter",
+        "対物倍率フィルタ objective_magnification",
         ["all", *OBJECTIVE_MAGNIFICATIONS],
         index=0,
     )
-    exclude_ignore_from_yolo = st.sidebar.checkbox("Exclude ignore from YOLO export", value=True)
+    exclude_ignore_from_yolo = st.sidebar.checkbox("YOLO出力から ignore を除外", value=True)
     used_for_training_only_export = st.sidebar.checkbox(
-        "Export used_for_training only",
+        "used_for_training=true のみ出力",
         value=True,
-        help="Keep this enabled for training exports. Unconfirmed imported candidates stay out of training data.",
+        help="学習用exportでは有効のままにしてください。未確認のimport候補は学習データから除外されます。",
     )
     only_reviewed_or_exported = st.sidebar.checkbox(
-        "YOLO dataset: reviewed/exported only",
+        "YOLO datasetは reviewed/exported のみ",
         value=True,
-        help="Use only human-confirmed or explicitly exported images for the training dataset.",
+        help="確認済みまたはexport対象として明示された画像だけを学習datasetに使います。",
     )
 
-    st.sidebar.subheader("Save / Restore")
-    uploaded_annotations = st.sidebar.file_uploader("Restore annotations.json", type=["json"])
-    st.sidebar.subheader("Candidate Import")
-    uploaded_candidates = st.sidebar.file_uploader("Import candidate bbox CSV/JSON", type=["csv", "json"])
+    st.sidebar.subheader("保存/復元")
+    uploaded_annotations = st.sidebar.file_uploader("annotations.json を復元", type=["json"])
+    st.sidebar.subheader("AI候補bboxのインポート")
+    uploaded_candidates = st.sidebar.file_uploader("候補bbox CSV/JSONを読み込む", type=["csv", "json"])
     candidate_import_source = st.sidebar.selectbox(
-        "candidate_source for import",
+        "import候補の由来 candidate_source",
         CANDIDATE_IMPORT_SOURCES,
         index=CANDIDATE_IMPORT_SOURCES.index("imported_open_eoe"),
     )
@@ -1860,8 +1860,8 @@ def render_sidebar() -> tuple[
 def render_ecrs_notice(project_template: str) -> None:
     if project_template == "ECRS_nasal_polyp":
         st.info(
-            "For research use only. This project supports eosinophil quantification in "
-            "H&E-stained nasal polyp / sinonasal mucosa images. Not intended for clinical diagnosis."
+            "研究用ツールです。H&E染色された鼻茸/副鼻腔粘膜画像の好酸球定量補助を目的とします。"
+            "臨床診断目的では使用しないでください。"
         )
 
 
@@ -1877,33 +1877,33 @@ def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
         st.error(str(error))
         return None
     except Exception as error:
-        st.error(f"Could not open WSI file for patch creation: {error}")
+        st.error(f"patch作成用にWSIファイルを開けませんでした: {error}")
         return None
 
     source_key = f"{uploaded_image.name}:{uploaded_image.size}"
     active_patch = st.session_state.active_patch
     if active_patch and st.session_state.active_patch_source == source_key:
-        st.success(f"Patch loaded for annotation: {active_patch['image_name']}")
-        if st.button("Create another patch from this WSI", use_container_width=True):
+        st.success(f"アノテーション用patchを読み込みました: {active_patch['image_name']}")
+        if st.button("このWSIから別のpatchを作成", use_container_width=True):
             st.session_state.active_patch = None
             st.session_state.active_patch_source = None
             st.rerun()
         apply_patch_metadata_to_session(active_patch.get("patch_metadata", {}))
         return active_patch
 
-    st.subheader("WSI ROI Patch Creator")
+    st.subheader("WSI ROIパッチ作成")
     st.caption(
-        "Select a rectangular ROI on the low-magnification thumbnail, then create a patch for annotation. "
-        "The full WSI is not loaded into the annotation canvas."
+        "低倍率thumbnail上で矩形ROIを選び、アノテーション用patchを作成します。"
+        "巨大WSI全体はannotation canvasに直接載せません。"
     )
     st.caption(
-        f"WSI size: {thumbnail_info['wsi_width']} x {thumbnail_info['wsi_height']} px | "
+        f"WSIサイズ: {thumbnail_info['wsi_width']} x {thumbnail_info['wsi_height']} px | "
         f"thumbnail: {thumbnail_info['thumbnail_width']} x {thumbnail_info['thumbnail_height']} px | "
         f"mpp: {thumbnail_info.get('mpp_x', '')}, {thumbnail_info.get('mpp_y', '')}"
     )
 
     controls = st.columns(4)
-    patch_size = controls[0].selectbox("Patch size", PATCH_SIZE_OPTIONS, index=0)
+    patch_size = controls[0].selectbox("patchサイズ", PATCH_SIZE_OPTIONS, index=0)
     target_mpp = controls[1].text_input("target_mpp", value=str(thumbnail_info.get("mpp_x") or ""))
     manual_x = controls[2].number_input("patch_x", min_value=0, value=0, step=256)
     manual_y = controls[3].number_input("patch_y", min_value=0, value=0, step=256)
@@ -1925,15 +1925,15 @@ def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
         patch_x = selected_roi["x"]
         patch_y = selected_roi["y"]
         st.info(
-            f"Selected ROI origin: x={patch_x}, y={patch_y}. "
-            f"Patch output will be {patch_size} x {patch_size} px."
+            f"選択ROIの左上座標: x={patch_x}, y={patch_y}。"
+            f"{patch_size} x {patch_size} px のpatchを作成します。"
         )
     else:
         patch_x = int(manual_x)
         patch_y = int(manual_y)
-        st.info("No ROI rectangle selected yet. Manual patch_x / patch_y will be used.")
+        st.info("ROI矩形が未選択です。手入力の patch_x / patch_y を使用します。")
 
-    if st.button("Create patch from WSI ROI", use_container_width=True):
+    if st.button("WSI ROIからpatchを作成", use_container_width=True):
         existing_metadata = st.session_state.image_metadata.copy()
         patch = create_wsi_patch(
             wsi_path=wsi_path,
@@ -2013,7 +2013,7 @@ def process_candidate_import(
         candidate_import_source,
     )
     if not imported:
-        st.warning("No valid candidate bboxes were imported. Check required columns/fields.")
+        st.warning("有効な候補bboxを読み込めませんでした。必須列/項目を確認してください。")
         st.session_state.candidate_import_key = import_key
         return
 
@@ -2028,7 +2028,7 @@ def process_candidate_import(
     st.session_state.candidate_import_key = import_key
     st.session_state.canvas_key_version += 1
     st.session_state.canvas_initial_drawing_pending = True
-    st.success(f"Imported {len(imported)} candidate bboxes as unconfirmed annotations.")
+    st.success(f"{len(imported)}件の候補bboxを未確認アノテーションとして読み込みました。")
 
 
 def update_imported_candidate_status(annotation_status: str, used_for_training: bool) -> None:
@@ -2083,7 +2083,7 @@ def main() -> None:
     render_ecrs_notice(metadata.get("project_template", "custom"))
 
     if not uploaded_image:
-        st.info("Upload a jpg, png, tif, tiff, ndpi, or supported WSI image to begin annotation.")
+        st.info("jpg / png / tif / tiff / ndpi / 対応WSI画像をアップロードしてください。")
         return
 
     if is_wsi_file(uploaded_image.name):
@@ -2100,7 +2100,7 @@ def main() -> None:
     if prepared_image["source_format"] == "ndpi":
         conversion = prepared_image.get("conversion", {})
         st.info(
-            "NDPI was converted to OME-TIFF for annotation: "
+            "NDPIをアノテーション用OME-TIFFへ変換しました: "
             f"{prepared_image['source_image_path']} -> {prepared_image['image_path']} "
             f"(level={conversion.get('openslide_level', 'reused')}, "
             f"downsample={conversion.get('level_downsample', 'existing')})"
@@ -2108,7 +2108,7 @@ def main() -> None:
     if prepared_image["source_format"] == "wsi_patch":
         patch_metadata = prepared_image.get("patch_metadata", {})
         st.info(
-            "Annotating WSI patch: "
+            "WSI patchをアノテーション中: "
             f"{prepared_image['image_path']} from {patch_metadata.get('source_wsi_name', '')} "
             f"at x={patch_metadata.get('patch_x', '')}, y={patch_metadata.get('patch_y', '')}"
         )
@@ -2134,7 +2134,7 @@ def main() -> None:
         st.session_state.canvas_initial_drawing_pending = False
 
     st.caption(
-        "Draw annotations directly on the image. Counts and exports update after each completed shape."
+        "画像上に直接アノテーションを描画してください。図形を描き終えると、カウントと保存対象が更新されます。"
     )
     canvas_result = st_canvas(
         fill_color="rgba(255, 255, 255, 0)",
@@ -2181,24 +2181,24 @@ def main() -> None:
         st.session_state.image_original_size,
     )
     metric_cols = st.columns(5)
-    metric_cols[0].metric("eosinophil_count", metrics["eosinophil_count"])
-    metric_cols[1].metric("total_annotated_count", metrics["total_annotated_count"])
-    metric_cols[2].metric("eosinophil_ratio", f"{metrics['eosinophil_ratio']:.3f}")
-    metric_cols[3].metric("eos_per_HPF", str(metrics["eos_per_HPF"]))
-    metric_cols[4].metric("eos_per_mm2", str(metrics["eos_per_mm2"]))
+    metric_cols[0].metric("好酸球数", metrics["eosinophil_count"])
+    metric_cols[1].metric("総アノテーション数", metrics["total_annotated_count"])
+    metric_cols[2].metric("好酸球比率", f"{metrics['eosinophil_ratio']:.3f}")
+    metric_cols[3].metric("eos/HPF", str(metrics["eos_per_HPF"]))
+    metric_cols[4].metric("eos/mm2", str(metrics["eos_per_mm2"]))
 
     st.caption(
-        f"Original size: {image.size[0]} x {image.size[1]} px | "
-        f"Display scale: {st.session_state.scale_factor:.6f} | "
-        f"Global region_type: {st.session_state.region_annotations.get('global_region_type', 'unknown')}"
+        f"元画像サイズ: {image.size[0]} x {image.size[1]} px | "
+        f"表示倍率: {st.session_state.scale_factor:.6f} | "
+        f"画像全体のregion_type: {st.session_state.region_annotations.get('global_region_type', 'unknown')}"
     )
 
     table_left, table_right = st.columns([2, 1])
     with table_left:
-        st.subheader("Annotations")
+        st.subheader("アノテーション一覧")
         st.dataframe(annotations_dataframe(export_annotations), hide_index=True, use_container_width=True)
     with table_right:
-        st.subheader("Counts")
+        st.subheader("カウント")
         st.dataframe(counts_df, hide_index=True, use_container_width=True)
 
     save_disabled = not st.session_state.image_name
@@ -2209,28 +2209,28 @@ def main() -> None:
     missing_metadata = missing_required_metadata(st.session_state.image_metadata)
     if missing_metadata:
         st.warning(
-            "Missing required metadata: "
+            "必須メタデータが未入力です: "
             + ", ".join(missing_metadata)
-            + ". Saving is still allowed for this MVP."
+            + "。MVPのため保存自体は可能です。"
         )
 
     imported_count = sum(1 for item in st.session_state.annotation_table if item.get("candidate_source", "manual") != "manual")
     if imported_count:
-        st.caption(f"Imported candidate annotations in current image: {imported_count}")
+        st.caption(f"現在の画像に含まれるAI候補アノテーション: {imported_count}件")
         candidate_cols = st.columns(2)
-        if candidate_cols[0].button("Confirm all imported candidates", use_container_width=True):
+        if candidate_cols[0].button("import候補をすべて確認済みにする", use_container_width=True):
             update_imported_candidate_status("confirmed_by_human", True)
             st.rerun()
-        if candidate_cols[1].button("Reject all imported candidates", use_container_width=True):
+        if candidate_cols[1].button("import候補をすべてrejectする", use_container_width=True):
             update_imported_candidate_status("rejected", False)
             st.rerun()
 
-    if st.button("Refresh canvas", disabled=save_disabled, use_container_width=True):
+    if st.button("キャンバスを再読み込み", disabled=save_disabled, use_container_width=True):
         st.session_state.canvas_key_version += 1
         st.session_state.canvas_initial_drawing_pending = True
         st.rerun()
 
-    if st.button("Save exports", disabled=save_disabled, use_container_width=True):
+    if st.button("保存/export", disabled=save_disabled, use_container_width=True):
         paths = save_outputs(
             st.session_state.image_name,
             st.session_state.original_image_path,
@@ -2243,22 +2243,22 @@ def main() -> None:
             exclude_ignore_from_yolo,
             used_for_training_only_export,
         )
-        st.session_state.last_saved_message = "Saved: " + " / ".join(str(path) for path in paths.values())
+        st.session_state.last_saved_message = "保存しました: " + " / ".join(str(path) for path in paths.values())
         st.rerun()
 
-    if st.button("Generate YOLO training dataset", use_container_width=True):
+    if st.button("YOLO学習用datasetを生成", use_container_width=True):
         dataset_result = generate_yolo_training_dataset(
             only_reviewed_or_exported=only_reviewed_or_exported,
             exclude_ignore=exclude_ignore_from_yolo,
             used_for_training_only=used_for_training_only_export,
         )
         st.success(
-            "YOLO dataset generated: "
-            f"{dataset_result['images']} images, {dataset_result['labels']} label files, "
-            f"data.yaml at {dataset_result['data_yaml']}"
+            "YOLO datasetを生成しました: "
+            f"画像 {dataset_result['images']}件、ラベル {dataset_result['labels']}件、"
+            f"data.yaml: {dataset_result['data_yaml']}"
         )
         if dataset_result["skipped"]:
-            st.warning("Skipped images: " + ", ".join(dataset_result["skipped"]))
+            st.warning("スキップした画像: " + ", ".join(dataset_result["skipped"]))
 
     download_payload = {
         "schema_version": "2.3",
@@ -2278,7 +2278,7 @@ def main() -> None:
     }
     dl_cols = st.columns(4)
     dl_cols[0].download_button(
-        "Download annotations.json",
+        "annotations.json をダウンロード",
         data=json.dumps(download_payload, ensure_ascii=False, indent=2),
         file_name="annotations.json",
         mime="application/json",
@@ -2286,7 +2286,7 @@ def main() -> None:
         use_container_width=True,
     )
     dl_cols[1].download_button(
-        "Download annotations.csv",
+        "annotations.csv をダウンロード",
         data=annotations_dataframe(export_annotations).to_csv(index=False).encode("utf-8-sig"),
         file_name="annotations.csv",
         mime="text/csv",
@@ -2294,7 +2294,7 @@ def main() -> None:
         use_container_width=True,
     )
     dl_cols[2].download_button(
-        "Download counts.csv",
+        "counts.csv をダウンロード",
         data=counts_with_metadata(
             counts_df,
             st.session_state.image_metadata,
@@ -2307,7 +2307,7 @@ def main() -> None:
         use_container_width=True,
     )
     dl_cols[3].download_button(
-        "Download YOLO label",
+        "YOLO label をダウンロード",
         data="\n".join(
             yolo_lines(
                 export_annotations,
