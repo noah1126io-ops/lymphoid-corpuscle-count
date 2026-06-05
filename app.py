@@ -2135,6 +2135,12 @@ def render_sidebar() -> tuple[
     bool,
 ]:
     st.sidebar.subheader("画像アップロード")
+    upload_limit = st.get_option("server.maxUploadSize")
+    st.sidebar.caption(f"現在のアップロード上限: {upload_limit} MB")
+    if upload_limit < 2048:
+        st.sidebar.warning(
+            "アップロード上限が200MB付近のままです。run_app.bat または run_app.ps1 から起動してください。"
+        )
     uploaded_image = st.sidebar.file_uploader(
         "組織画像をアップロード",
         type=["jpg", "jpeg", "png", "tif", "tiff", "ndpi", "svs", "scn", "vms", "vmu"],
