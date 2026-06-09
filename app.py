@@ -2540,12 +2540,42 @@ def activate_wsi_patch(
     existing_metadata = st.session_state.image_metadata.copy()
     reset_for_new_image()
     st.session_state.image_metadata.update(existing_metadata)
+    st.session_state.image_metadata["reviewed"] = False
+    st.session_state.image_metadata["exported"] = False
     st.session_state.active_patch = patch
     st.session_state.active_patch_source = source_key
     st.session_state.active_patch_queue_id = patch.get("patch_metadata", {}).get("patch_id")
     if queue_index is not None:
         st.session_state.patch_queue_index = queue_index
     apply_patch_metadata_to_session(patch.get("patch_metadata", {}))
+
+
+def activate_adjacent_queue_patch(
+    source_wsi_name: str,
+    current_patch_id: str,
+    offset: int,
+) -> bool:
+    queue_rows = patch_queue_rows(source_wsi_name)
+    matches = queue_rows.index[queue_rows["patch_id"] == current_patch_id].tolist()
+    if not matches:
+        return False
+    target_index = int(matches[0]) + offset
+    if target_index < 0 or target_index >= len(queue_rows):
+        return False
+
+    wsi_path = ORIGINAL_WSI_DIR / source_wsi_name
+    if not wsi_path.exists():
+        return False
+    _, thumbnail_info = make_wsi_thumbnail(wsi_path)
+    target_row = queue_rows.iloc[target_index].to_dict()
+    patch = prepared_patch_from_manifest_row(target_row, wsi_path, thumbnail_info)
+    if target_row["status"] == "not_started":
+        update_patch_manifest_status(source_wsi_name, target_row["patch_id"], "in_progress")
+    source_key = st.session_state.active_patch_source
+    if not source_key:
+        source_key = f"{source_wsi_name}:{wsi_path.stat().st_size}"
+    activate_wsi_patch(patch, source_key, target_index)
+    return True
 
 
 def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
@@ -2631,7 +2661,7 @@ def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
     level_downsamples = thumbnail_info.get("level_downsamples", [1.0])
     level_options = list(range(len(level_dimensions)))
 
-    with st.expander("自動patch queue", expanded=queue_rows.empty):
+    with st.expander("自動patch queue", expanded=True):
         st.caption(
             "WSIを非重複tileに分割し、低倍率thumbnailと実patchの組織率で白背景を除外します。"
         )
@@ -2744,6 +2774,14 @@ def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
             )
         else:
             st.info("このWSIのpatch queueはまだありません。")
+
+    show_manual_roi = st.toggle(
+        "手動ROI patchを表示",
+        value=False,
+        help="自動patch queueを使わず、任意の場所を手動で切り出す場合だけ有効にします。",
+    )
+    if not show_manual_roi:
+        return None
 
     st.markdown("#### 手動ROI patch")
     st.caption("従来どおり、任意位置を確認して1枚ずつpatchを作成できます。")
@@ -3098,6 +3136,153 @@ def main() -> None:
         st.session_state.image_original_size,
     )
 
+    current_wsi_name = str(st.session_state.image_metadata.get("source_wsi_name", ""))
+    current_patch_id = str(st.session_state.image_metadata.get("patch_id", ""))
+    queue_manifest = load_patch_manifest()
+    queue_mask = (
+        (queue_manifest["source_wsi_name"] == current_wsi_name)
+        & (queue_manifest["patch_id"] == current_patch_id)
+        if not queue_manifest.empty
+        else pd.Series(dtype=bool)
+    )
+    if not queue_manifest.empty and queue_mask.any():
+        current_queue_status = str(queue_manifest.loc[queue_mask, "status"].iloc[0])
+        source_queue = patch_queue_rows(current_wsi_name)
+        queue_matches = source_queue.index[source_queue["patch_id"] == current_patch_id].tolist()
+        current_queue_index = int(queue_matches[0]) if queue_matches else 0
+        completed = int(source_queue["status"].isin(["done", "reviewed_empty"]).sum())
+
+        st.markdown("#### Patch queue操作")
+        st.progress(
+            completed / len(source_queue) if len(source_queue) else 0,
+            text=(
+                f"{current_queue_index + 1}/{len(source_queue)} | 完了 {completed}/{len(source_queue)} | "
+                f"status: {current_queue_status}"
+            ),
+        )
+        primary_actions = st.columns(4)
+        if primary_actions[0].button(
+            "保存して次へ",
+            type="primary",
+            use_container_width=True,
+        ):
+            st.session_state.image_metadata["reviewed"] = True
+            st.session_state.image_metadata["exported"] = True
+            paths = save_outputs(
+                st.session_state.image_name,
+                st.session_state.original_image_path,
+                st.session_state.image_original_size,
+                export_annotations,
+                counts_df,
+                st.session_state.image_metadata,
+                st.session_state.region_annotations,
+                objective_filter,
+                exclude_ignore_from_yolo,
+                used_for_training_only_export,
+            )
+            update_patch_manifest_status(
+                current_wsi_name,
+                current_patch_id,
+                "done",
+                export_annotations,
+            )
+            moved = activate_adjacent_queue_patch(current_wsi_name, current_patch_id, 1)
+            st.session_state.last_saved_message = (
+                "保存して次のpatchへ移動しました。"
+                if moved
+                else "保存しました。queueの最後のpatchです。"
+            )
+            st.rerun()
+        if primary_actions[1].button("好酸球なしで保存して次へ", use_container_width=True):
+            st.session_state.image_metadata["reviewed"] = True
+            st.session_state.image_metadata["exported"] = True
+            eos_negative_annotations = [
+                item for item in export_annotations if item.get("label") != "eosinophil"
+            ]
+            eos_negative_counts = count_annotations(
+                eos_negative_annotations,
+                st.session_state.image_metadata,
+                st.session_state.image_original_size,
+            )
+            save_outputs(
+                st.session_state.image_name,
+                st.session_state.original_image_path,
+                st.session_state.image_original_size,
+                eos_negative_annotations,
+                eos_negative_counts,
+                st.session_state.image_metadata,
+                st.session_state.region_annotations,
+                objective_filter,
+                exclude_ignore_from_yolo,
+                used_for_training_only_export,
+            )
+            update_patch_manifest_status(
+                current_wsi_name,
+                current_patch_id,
+                "reviewed_empty",
+                eos_negative_annotations,
+            )
+            moved = activate_adjacent_queue_patch(current_wsi_name, current_patch_id, 1)
+            if not moved:
+                st.session_state.annotation_table = []
+                st.session_state.canvas_objects = []
+                st.session_state.canvas_key_version += 1
+                st.session_state.canvas_initial_drawing_pending = True
+            st.session_state.last_saved_message = (
+                "好酸球0件の確認済みpatchとして保存し、次へ移動しました。"
+                if moved
+                else "好酸球0件の確認済みpatchとして保存しました。queueの最後です。"
+            )
+            st.rerun()
+        if primary_actions[2].button(
+            "前のpatch",
+            disabled=current_queue_index <= 0,
+            use_container_width=True,
+        ):
+            activate_adjacent_queue_patch(current_wsi_name, current_patch_id, -1)
+            st.rerun()
+        if primary_actions[3].button(
+            "次のpatch",
+            disabled=current_queue_index >= len(source_queue) - 1,
+            help="未保存の変更は保存されません。",
+            use_container_width=True,
+        ):
+            activate_adjacent_queue_patch(current_wsi_name, current_patch_id, 1)
+            st.rerun()
+
+        secondary_actions = st.columns(3)
+        if secondary_actions[0].button("このpatchを保存のみ", use_container_width=True):
+            st.session_state.image_metadata["reviewed"] = True
+            st.session_state.image_metadata["exported"] = True
+            paths = save_outputs(
+                st.session_state.image_name,
+                st.session_state.original_image_path,
+                st.session_state.image_original_size,
+                export_annotations,
+                counts_df,
+                st.session_state.image_metadata,
+                st.session_state.region_annotations,
+                objective_filter,
+                exclude_ignore_from_yolo,
+                used_for_training_only_export,
+            )
+            update_patch_manifest_status(
+                current_wsi_name,
+                current_patch_id,
+                "done",
+                export_annotations,
+            )
+            st.session_state.last_saved_message = "patchを保存しました: " + str(paths["annotations_json"])
+            st.rerun()
+        if secondary_actions[1].button("Skipして次へ", use_container_width=True):
+            update_patch_manifest_status(current_wsi_name, current_patch_id, "skipped", export_annotations)
+            activate_adjacent_queue_patch(current_wsi_name, current_patch_id, 1)
+            st.rerun()
+        if secondary_actions[2].button("要確認にして次へ", use_container_width=True):
+            update_patch_manifest_status(current_wsi_name, current_patch_id, "flagged", export_annotations)
+            activate_adjacent_queue_patch(current_wsi_name, current_patch_id, 1)
+            st.rerun()
+
     metrics = calculate_ecrs_counts(
         export_annotations,
         st.session_state.image_metadata,
@@ -3136,83 +3321,6 @@ def main() -> None:
             + ", ".join(missing_metadata)
             + "。MVPのため保存自体は可能です。"
         )
-
-    current_wsi_name = str(st.session_state.image_metadata.get("source_wsi_name", ""))
-    current_patch_id = str(st.session_state.image_metadata.get("patch_id", ""))
-    queue_manifest = load_patch_manifest()
-    queue_mask = (
-        (queue_manifest["source_wsi_name"] == current_wsi_name)
-        & (queue_manifest["patch_id"] == current_patch_id)
-        if not queue_manifest.empty
-        else pd.Series(dtype=bool)
-    )
-    if not queue_manifest.empty and queue_mask.any():
-        current_queue_status = str(queue_manifest.loc[queue_mask, "status"].iloc[0])
-        st.subheader("Patch queue")
-        st.caption(f"現在のstatus: {current_queue_status} | patch_id: {current_patch_id}")
-        queue_actions = st.columns(4)
-        if queue_actions[0].button("Mark done", use_container_width=True):
-            st.session_state.image_metadata["reviewed"] = True
-            st.session_state.image_metadata["exported"] = True
-            paths = save_outputs(
-                st.session_state.image_name,
-                st.session_state.original_image_path,
-                st.session_state.image_original_size,
-                export_annotations,
-                counts_df,
-                st.session_state.image_metadata,
-                st.session_state.region_annotations,
-                objective_filter,
-                exclude_ignore_from_yolo,
-                used_for_training_only_export,
-            )
-            update_patch_manifest_status(
-                current_wsi_name,
-                current_patch_id,
-                "done",
-                export_annotations,
-            )
-            st.session_state.last_saved_message = "Mark doneとして保存しました: " + str(paths["annotations_json"])
-            st.rerun()
-        if queue_actions[1].button("Mark empty", use_container_width=True):
-            st.session_state.image_metadata["reviewed"] = True
-            st.session_state.image_metadata["exported"] = True
-            empty_annotations: list[dict[str, Any]] = []
-            empty_counts = count_annotations(
-                empty_annotations,
-                st.session_state.image_metadata,
-                st.session_state.image_original_size,
-            )
-            paths = save_outputs(
-                st.session_state.image_name,
-                st.session_state.original_image_path,
-                st.session_state.image_original_size,
-                empty_annotations,
-                empty_counts,
-                st.session_state.image_metadata,
-                st.session_state.region_annotations,
-                objective_filter,
-                exclude_ignore_from_yolo,
-                used_for_training_only_export,
-            )
-            st.session_state.annotation_table = []
-            st.session_state.canvas_objects = []
-            st.session_state.canvas_key_version += 1
-            st.session_state.canvas_initial_drawing_pending = True
-            update_patch_manifest_status(
-                current_wsi_name,
-                current_patch_id,
-                "reviewed_empty",
-                empty_annotations,
-            )
-            st.session_state.last_saved_message = "陰性patchとして保存しました: " + str(paths["annotations_json"])
-            st.rerun()
-        if queue_actions[2].button("Skip", use_container_width=True):
-            update_patch_manifest_status(current_wsi_name, current_patch_id, "skipped", export_annotations)
-            st.rerun()
-        if queue_actions[3].button("Flag for review", use_container_width=True):
-            update_patch_manifest_status(current_wsi_name, current_patch_id, "flagged", export_annotations)
-            st.rerun()
 
     imported_count = sum(1 for item in st.session_state.annotation_table if item.get("candidate_source", "manual") != "manual")
     if imported_count:

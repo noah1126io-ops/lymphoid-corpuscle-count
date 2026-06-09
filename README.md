@@ -127,11 +127,20 @@ queue status:
 - `not_started`: 未確認
 - `in_progress`: 確認中
 - `done`: アノテーション確認・保存済み
-- `reviewed_empty`: 人間が陰性patchとして確認済み
+- `reviewed_empty`: 人間が好酸球0件と確認した陰性patch
 - `skipped`: 今回は確認対象外
 - `flagged`: 再確認が必要
 
-アノテーション画面では`Previous patch`、`Next patch`、`Mark done`、`Mark empty`、`Skip`、`Flag for review`を使用できます。`Mark done`は現在のannotationを保存し、`Mark empty`はannotationなしの陰性patchとして空のYOLOラベルを保存します。patch移動前には必要なannotationを保存してください。
+アノテーション画像のすぐ下に、queue操作をまとめて表示します。
+
+- `保存して次へ`: 現在のannotationを`done`として保存し、次のpatchへ移動
+- `好酸球なしで保存して次へ`: `eosinophil`を0件として確認し、`reviewed_empty`で保存して次へ移動。`ignore`、`artifact`、その他細胞のannotationは保持
+- `前のpatch` / `次のpatch`: 保存せずに前後移動
+- `このpatchを保存のみ`: 保存後も現在のpatchに留まる
+- `Skipして次へ`: `skipped`にして次へ移動
+- `要確認にして次へ`: `flagged`にして次へ移動
+
+手動ROI patch画面は初期状態では非表示です。「手動ROI patchを表示」トグルを有効にした場合だけ、WSIビューア、ROI選択、座標入力を表示します。通常作業では自動patch queueを使用してください。
 
 `patch_manifest.csv`の主な列:
 
@@ -146,7 +155,7 @@ queue status:
 - `annotation_count`
 - `eosinophil_count`
 
-学習dataset生成時に「patch queueは done / reviewed_empty のみ」を有効にすると、queue管理されたpatchのうち、人間による確認が完了したpatchだけを出力します。`reviewed_empty`は陰性学習画像として画像を保存し、対応するYOLOラベルは空ファイルになります。手動作成した従来patchはqueue statusがないため、既存の`reviewed / exported`条件で扱われます。
+学習dataset生成時に「patch queueは done / reviewed_empty のみ」を有効にすると、queue管理されたpatchのうち、人間による確認が完了したpatchだけを出力します。`reviewed_empty`は「画像内の対象クラスである好酸球が0件」と人間が確認した陰性patchです。`ignore`は対象細胞ではなく、学習・評価から除外する領域または判定不能物として扱います。手動作成した従来patchはqueue statusがないため、既存の`reviewed / exported`条件で扱われます。
 
 ## Multi-Tissue Eosinophil Reference Dataset
 
