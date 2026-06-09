@@ -294,6 +294,7 @@ ORIGINAL_WSI_DIR = IMAGE_DIR / "original_wsi"
 CONVERTED_IMAGE_DIR = IMAGE_DIR / "converted"
 PATCH_DIR = DATA_DIR / "patches"
 PATCH_IMAGE_DIR = PATCH_DIR / "images"
+PATCH_MANIFEST_PATH = PATCH_DIR / "patch_manifest.csv"
 ANNOTATION_DIR = DATA_DIR / "annotations"
 EXPORT_DIR = DATA_DIR / "exports"
 YOLO_DIR = EXPORT_DIR / "yolo_labels"
@@ -307,6 +308,33 @@ WSI_EXTENSIONS = {".ndpi", ".svs", ".scn", ".vms", ".vmu"}
 MAX_NDPI_CONVERSION_PIXELS = 30_000_000
 WSI_THUMBNAIL_MAX_SIZE = (1100, 700)
 PATCH_DIMENSION_OPTIONS = [512, 1024, 1536, 2048]
+PATCH_QUEUE_SIZE_OPTIONS = [1024, 2048]
+PATCH_QUEUE_STATUSES = [
+    "not_started",
+    "in_progress",
+    "done",
+    "reviewed_empty",
+    "skipped",
+    "flagged",
+]
+PATCH_MANIFEST_FIELDS = [
+    "source_wsi_name",
+    "patch_id",
+    "image_path",
+    "patch_x",
+    "patch_y",
+    "patch_width",
+    "patch_height",
+    "patch_level",
+    "patch_downsample",
+    "target_mpp",
+    "objective_magnification",
+    "tissue_ratio",
+    "status",
+    "annotation_count",
+    "eosinophil_count",
+    "updated_at",
+]
 WSI_TILE_SIZE = 256
 WSI_TILE_SERVER_PORT = 8765
 WSI_TILE_SOURCES: dict[str, Path] = {}
@@ -452,6 +480,8 @@ def init_session_state() -> None:
         "candidate_import_key": None,
         "active_patch": None,
         "active_patch_source": None,
+        "active_patch_queue_id": None,
+        "patch_queue_index": 0,
         "project_template": "ECRS_nasal_polyp",
         "image_metadata": default_image_metadata("ECRS_nasal_polyp"),
         "region_annotations": default_region_annotations(),
@@ -1025,6 +1055,266 @@ def create_wsi_patch(
             "patch_level0_width": patch_level0_width,
             "patch_level0_height": patch_level0_height,
             "target_mpp": target_mpp,
+            "mpp_x": thumbnail_info.get("mpp_x", ""),
+            "mpp_y": thumbnail_info.get("mpp_y", ""),
+        },
+    }
+
+
+def calculate_tissue_ratio(image: Image.Image, sample_size: int = 256) -> float:
+    """Estimate the fraction of non-background H&E pixels in an image."""
+    sample = image.convert("RGB")
+    sample.thumbnail((sample_size, sample_size), Image.Resampling.BILINEAR)
+    pixels = list(sample.getdata())
+    if not pixels:
+        return 0.0
+
+    tissue_pixels = 0
+    for red, green, blue in pixels:
+        brightness = (red + green + blue) / 3
+        saturation = max(red, green, blue) - min(red, green, blue)
+        if brightness < 220 or (brightness < 245 and saturation > 8):
+            tissue_pixels += 1
+    return tissue_pixels / len(pixels)
+
+
+def load_patch_manifest() -> pd.DataFrame:
+    if not PATCH_MANIFEST_PATH.exists():
+        return pd.DataFrame(columns=PATCH_MANIFEST_FIELDS)
+    try:
+        manifest = pd.read_csv(PATCH_MANIFEST_PATH, dtype=str, keep_default_na=False)
+    except (OSError, pd.errors.ParserError):
+        return pd.DataFrame(columns=PATCH_MANIFEST_FIELDS)
+    for field in PATCH_MANIFEST_FIELDS:
+        if field not in manifest.columns:
+            manifest[field] = ""
+    return manifest[PATCH_MANIFEST_FIELDS]
+
+
+def save_patch_manifest(manifest: pd.DataFrame) -> None:
+    PATCH_MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    normalized = manifest.copy()
+    for field in PATCH_MANIFEST_FIELDS:
+        if field not in normalized.columns:
+            normalized[field] = ""
+    normalized[PATCH_MANIFEST_FIELDS].to_csv(
+        PATCH_MANIFEST_PATH,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+
+def patch_queue_rows(source_wsi_name: str) -> pd.DataFrame:
+    manifest = load_patch_manifest()
+    if manifest.empty:
+        return manifest
+    rows = manifest[manifest["source_wsi_name"] == source_wsi_name].copy()
+    if rows.empty:
+        return rows
+    rows["_patch_y"] = pd.to_numeric(rows["patch_y"], errors="coerce").fillna(0)
+    rows["_patch_x"] = pd.to_numeric(rows["patch_x"], errors="coerce").fillna(0)
+    return rows.sort_values(["_patch_y", "_patch_x"]).drop(columns=["_patch_y", "_patch_x"]).reset_index(drop=True)
+
+
+def update_patch_manifest_status(
+    source_wsi_name: str,
+    patch_id: str,
+    status: str,
+    annotations: list[dict[str, Any]] | None = None,
+) -> None:
+    if status not in PATCH_QUEUE_STATUSES:
+        raise ValueError(f"Unknown patch status: {status}")
+    manifest = load_patch_manifest()
+    if manifest.empty:
+        return
+    mask = (manifest["source_wsi_name"] == source_wsi_name) & (manifest["patch_id"] == patch_id)
+    if not mask.any():
+        return
+    manifest.loc[mask, "status"] = status
+    manifest.loc[mask, "updated_at"] = datetime.now().isoformat(timespec="seconds")
+    if annotations is not None:
+        manifest.loc[mask, "annotation_count"] = str(len(annotations))
+        manifest.loc[mask, "eosinophil_count"] = str(
+            sum(1 for item in annotations if item.get("label") == "eosinophil")
+        )
+    save_patch_manifest(manifest)
+
+
+def update_patch_manifest_counts(
+    source_wsi_name: str,
+    patch_id: str,
+    annotations: list[dict[str, Any]],
+) -> None:
+    manifest = load_patch_manifest()
+    if manifest.empty:
+        return
+    mask = (manifest["source_wsi_name"] == source_wsi_name) & (manifest["patch_id"] == patch_id)
+    if not mask.any():
+        return
+    manifest.loc[mask, "annotation_count"] = str(len(annotations))
+    manifest.loc[mask, "eosinophil_count"] = str(
+        sum(1 for item in annotations if item.get("label") == "eosinophil")
+    )
+    manifest.loc[mask, "updated_at"] = datetime.now().isoformat(timespec="seconds")
+    save_patch_manifest(manifest)
+
+
+def generate_wsi_patch_queue(
+    wsi_path: Path,
+    wsi_name: str,
+    patch_size: int,
+    level: int,
+    thumbnail: Image.Image,
+    thumbnail_info: dict[str, Any],
+    target_mpp: str,
+    objective_magnification: str,
+    minimum_tissue_ratio: float,
+    progress_callback: Any | None = None,
+) -> dict[str, int]:
+    """Create non-overlapping tissue patches and upsert them into the queue manifest."""
+    level_dimensions = thumbnail_info.get("level_dimensions", [])
+    level_downsamples = thumbnail_info.get("level_downsamples", [])
+    if level >= len(level_dimensions):
+        raise ValueError("Selected OpenSlide level is unavailable.")
+
+    level_width, level_height = level_dimensions[level]
+    downsample = float(level_downsamples[level])
+    base_mpp = safe_float(thumbnail_info.get("mpp_x"))
+    resolved_target_mpp = (
+        target_mpp
+        or (f"{base_mpp * downsample:.6f}" if base_mpp is not None else "")
+    )
+    patch_level0_size = int(round(patch_size * downsample))
+    x_positions = range(0, max(0, level_width - patch_size) + 1, patch_size)
+    y_positions = range(0, max(0, level_height - patch_size) + 1, patch_size)
+    grid = [(x, y) for y in y_positions for x in x_positions]
+    existing_manifest = load_patch_manifest()
+    existing_lookup = {
+        (row["source_wsi_name"], row["patch_id"]): row
+        for _, row in existing_manifest.iterrows()
+    }
+    generated_rows: list[dict[str, Any]] = []
+    excluded = 0
+
+    slide = open_wsi_slide(wsi_path)
+    try:
+        for index, (level_x, level_y) in enumerate(grid):
+            patch_x = int(round(level_x * downsample))
+            patch_y = int(round(level_y * downsample))
+            thumb_left = int(patch_x / thumbnail_info["scale_x"])
+            thumb_top = int(patch_y / thumbnail_info["scale_y"])
+            thumb_right = max(
+                thumb_left + 1,
+                int((patch_x + patch_level0_size) / thumbnail_info["scale_x"]),
+            )
+            thumb_bottom = max(
+                thumb_top + 1,
+                int((patch_y + patch_level0_size) / thumbnail_info["scale_y"]),
+            )
+            thumbnail_crop = thumbnail.crop((thumb_left, thumb_top, thumb_right, thumb_bottom))
+            thumbnail_ratio = calculate_tissue_ratio(thumbnail_crop)
+            if thumbnail_ratio < minimum_tissue_ratio * 0.5:
+                excluded += 1
+                if progress_callback:
+                    progress_callback(index + 1, len(grid))
+                continue
+
+            patch = slide.read_region((patch_x, patch_y), level, (patch_size, patch_size))
+            if patch.mode == "RGBA":
+                background = Image.new("RGBA", patch.size, (255, 255, 255, 255))
+                patch = Image.alpha_composite(background, patch)
+            patch = patch.convert("RGB")
+            tissue_ratio = calculate_tissue_ratio(patch)
+            if tissue_ratio < minimum_tissue_ratio:
+                excluded += 1
+                if progress_callback:
+                    progress_callback(index + 1, len(grid))
+                continue
+
+            patch_id = f"patch_x{patch_x}_y{patch_y}_level{level}_{patch_size}x{patch_size}"
+            output_path = patch_image_path(wsi_name, patch_id)
+            if not output_path.exists():
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                patch.save(output_path)
+
+            previous = existing_lookup.get((wsi_name, patch_id), {})
+            generated_rows.append(
+                {
+                    "source_wsi_name": wsi_name,
+                    "patch_id": patch_id,
+                    "image_path": str(output_path),
+                    "patch_x": patch_x,
+                    "patch_y": patch_y,
+                    "patch_width": patch_size,
+                    "patch_height": patch_size,
+                    "patch_level": level,
+                    "patch_downsample": downsample,
+                    "target_mpp": resolved_target_mpp,
+                    "objective_magnification": objective_magnification,
+                    "tissue_ratio": f"{tissue_ratio:.6f}",
+                    "status": previous.get("status", "not_started"),
+                    "annotation_count": previous.get("annotation_count", "0"),
+                    "eosinophil_count": previous.get("eosinophil_count", "0"),
+                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+                }
+            )
+            if progress_callback:
+                progress_callback(index + 1, len(grid))
+    finally:
+        slide.close()
+
+    other_rows = existing_manifest[existing_manifest["source_wsi_name"] != wsi_name].copy()
+    generated_frame = pd.DataFrame(generated_rows, columns=PATCH_MANIFEST_FIELDS)
+    combined = (
+        generated_frame
+        if other_rows.empty
+        else pd.concat([other_rows, generated_frame], ignore_index=True)
+    )
+    save_patch_manifest(combined)
+    return {"generated": len(generated_rows), "excluded": excluded, "total_tiles": len(grid)}
+
+
+def prepared_patch_from_manifest_row(
+    row: dict[str, Any],
+    wsi_path: Path,
+    thumbnail_info: dict[str, Any],
+) -> dict[str, Any]:
+    patch_id = str(row["patch_id"])
+    image_path = Path(str(row.get("image_path", "")))
+    if not image_path.exists():
+        image_path = patch_image_path(str(row["source_wsi_name"]), patch_id)
+    if not image_path.exists():
+        patch = read_wsi_region_rgb(
+            wsi_path,
+            int(float(row["patch_x"])),
+            int(float(row["patch_y"])),
+            int(float(row["patch_level"])),
+            int(float(row["patch_width"])),
+            int(float(row["patch_height"])),
+        )
+        image_path.parent.mkdir(parents=True, exist_ok=True)
+        patch.save(image_path)
+
+    downsample = float(row.get("patch_downsample") or 1.0)
+    patch_width = int(float(row["patch_width"]))
+    patch_height = int(float(row["patch_height"]))
+    return {
+        "image_name": image_path.name,
+        "image_path": image_path,
+        "source_image_path": wsi_path,
+        "source_format": "wsi_patch",
+        "patch_metadata": {
+            "source_wsi_name": str(row["source_wsi_name"]),
+            "patch_id": patch_id,
+            "patch_x": int(float(row["patch_x"])),
+            "patch_y": int(float(row["patch_y"])),
+            "patch_width": patch_width,
+            "patch_height": patch_height,
+            "patch_level": int(float(row["patch_level"])),
+            "patch_downsample": downsample,
+            "patch_level0_width": int(round(patch_width * downsample)),
+            "patch_level0_height": int(round(patch_height * downsample)),
+            "target_mpp": row.get("target_mpp", ""),
             "mpp_x": thumbnail_info.get("mpp_x", ""),
             "mpp_y": thumbnail_info.get("mpp_y", ""),
         },
@@ -1631,15 +1921,33 @@ def generate_yolo_training_dataset(
     only_reviewed_or_exported: bool,
     exclude_ignore: bool,
     used_for_training_only: bool,
+    only_completed_patch_queue: bool = False,
 ) -> dict[str, Any]:
     ensure_directories()
     exported_images = 0
     exported_labels = 0
     skipped_images = []
+    patch_manifest = load_patch_manifest()
+    patch_status_lookup = {
+        (row["source_wsi_name"], row["patch_id"]): row["status"]
+        for _, row in patch_manifest.iterrows()
+    }
 
     for payload in saved_annotation_payloads():
         metadata = payload.get("image_metadata", {})
         if only_reviewed_or_exported and not (metadata.get("reviewed") or metadata.get("exported")):
+            skipped_images.append(payload.get("image_name", "unknown"))
+            continue
+        patch_key = (
+            str(metadata.get("source_wsi_name", "")),
+            str(metadata.get("patch_id", "")),
+        )
+        queue_status = patch_status_lookup.get(patch_key)
+        if (
+            only_completed_patch_queue
+            and queue_status is not None
+            and queue_status not in {"done", "reviewed_empty"}
+        ):
             skipped_images.append(payload.get("image_name", "unknown"))
             continue
 
@@ -1878,6 +2186,11 @@ def save_outputs(
             )
         ),
         encoding="utf-8",
+    )
+    update_patch_manifest_counts(
+        str(metadata.get("source_wsi_name", "")),
+        str(metadata.get("patch_id", "")),
+        annotations,
     )
     regenerate_dataset_exports()
 
@@ -2172,6 +2485,12 @@ def render_sidebar() -> tuple[
         value=True,
         help="確認済みまたはexport対象として明示された画像だけを学習datasetに使います。",
     )
+    st.sidebar.checkbox(
+        "patch queueは done / reviewed_empty のみ",
+        value=True,
+        key="export_completed_patch_queue_only",
+        help="queue管理されたpatchでは、確認完了または陰性確認済みのpatchだけを学習datasetへ出力します。",
+    )
 
     st.sidebar.subheader("保存/復元")
     uploaded_annotations = st.sidebar.file_uploader("annotations.json を復元", type=["json"])
@@ -2213,6 +2532,22 @@ def apply_patch_metadata_to_session(patch_metadata: dict[str, Any]) -> None:
     st.session_state.image_metadata.update(patch_metadata)
 
 
+def activate_wsi_patch(
+    patch: dict[str, Any],
+    source_key: str,
+    queue_index: int | None = None,
+) -> None:
+    existing_metadata = st.session_state.image_metadata.copy()
+    reset_for_new_image()
+    st.session_state.image_metadata.update(existing_metadata)
+    st.session_state.active_patch = patch
+    st.session_state.active_patch_source = source_key
+    st.session_state.active_patch_queue_id = patch.get("patch_metadata", {}).get("patch_id")
+    if queue_index is not None:
+        st.session_state.patch_queue_index = queue_index
+    apply_patch_metadata_to_session(patch.get("patch_metadata", {}))
+
+
 def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
     try:
         wsi_path = save_uploaded_wsi(uploaded_image)
@@ -2225,12 +2560,58 @@ def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
         return None
 
     source_key = f"{uploaded_image.name}:{uploaded_image.size}"
+    queue_rows = patch_queue_rows(uploaded_image.name)
     active_patch = st.session_state.active_patch
     if active_patch and st.session_state.active_patch_source == source_key:
+        active_patch_id = active_patch.get("patch_metadata", {}).get("patch_id", "")
+        queue_match = queue_rows.index[queue_rows["patch_id"] == active_patch_id].tolist()
+        if queue_match:
+            current_index = int(queue_match[0])
+            st.session_state.patch_queue_index = current_index
+            current_row = queue_rows.iloc[current_index]
+            completed = int(queue_rows["status"].isin(["done", "reviewed_empty"]).sum())
+            st.progress(
+                completed / len(queue_rows) if len(queue_rows) else 0,
+                text=f"patch queue: {current_index + 1}/{len(queue_rows)} | 完了 {completed}/{len(queue_rows)}",
+            )
+            st.caption(
+                f"status: {current_row['status']} | tissue_ratio: {current_row['tissue_ratio']} | "
+                f"patch_id: {active_patch_id}"
+            )
+            navigation = st.columns([1, 1, 2])
+            if navigation[0].button("Previous patch", disabled=current_index <= 0, use_container_width=True):
+                previous_row = queue_rows.iloc[current_index - 1].to_dict()
+                previous = prepared_patch_from_manifest_row(
+                    previous_row,
+                    wsi_path,
+                    thumbnail_info,
+                )
+                if previous_row["status"] == "not_started":
+                    update_patch_manifest_status(uploaded_image.name, previous_row["patch_id"], "in_progress")
+                activate_wsi_patch(previous, source_key, current_index - 1)
+                st.rerun()
+            if navigation[1].button(
+                "Next patch",
+                disabled=current_index >= len(queue_rows) - 1,
+                use_container_width=True,
+            ):
+                following_row = queue_rows.iloc[current_index + 1].to_dict()
+                following = prepared_patch_from_manifest_row(
+                    following_row,
+                    wsi_path,
+                    thumbnail_info,
+                )
+                if following_row["status"] == "not_started":
+                    update_patch_manifest_status(uploaded_image.name, following_row["patch_id"], "in_progress")
+                activate_wsi_patch(following, source_key, current_index + 1)
+                st.rerun()
+            navigation[2].caption("移動前に必要なアノテーションを保存してください。")
+
         st.success(f"アノテーション用patchを読み込みました: {active_patch['image_name']}")
-        if st.button("このWSIから別のpatchを作成", use_container_width=True):
+        if st.button("patch選択画面へ戻る", use_container_width=True):
             st.session_state.active_patch = None
             st.session_state.active_patch_source = None
+            st.session_state.active_patch_queue_id = None
             st.rerun()
         apply_patch_metadata_to_session(active_patch.get("patch_metadata", {}))
         return active_patch
@@ -2249,6 +2630,123 @@ def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
     level_dimensions = thumbnail_info.get("level_dimensions", [(thumbnail_info["wsi_width"], thumbnail_info["wsi_height"])])
     level_downsamples = thumbnail_info.get("level_downsamples", [1.0])
     level_options = list(range(len(level_dimensions)))
+
+    with st.expander("自動patch queue", expanded=queue_rows.empty):
+        st.caption(
+            "WSIを非重複tileに分割し、低倍率thumbnailと実patchの組織率で白背景を除外します。"
+        )
+        queue_controls = st.columns(4)
+        queue_patch_size = queue_controls[0].selectbox(
+            "patch_size_px",
+            PATCH_QUEUE_SIZE_OPTIONS,
+            index=0,
+        )
+        queue_level = queue_controls[1].selectbox(
+            "queue level",
+            level_options,
+            index=0,
+            format_func=lambda item: (
+                f"level {item} "
+                f"(downsample {level_downsamples[item]:.1f}, {level_dimensions[item][0]}x{level_dimensions[item][1]})"
+            ),
+        )
+        base_mpp = safe_float(thumbnail_info.get("mpp_x"))
+        suggested_target_mpp = (
+            f"{base_mpp * float(level_downsamples[queue_level]):.6f}"
+            if base_mpp is not None
+            else ""
+        )
+        queue_target_mpp = queue_controls[2].text_input(
+            "queue target_mpp",
+            value=suggested_target_mpp,
+            key=f"queue_target_mpp_{uploaded_image.name}_{queue_level}",
+        )
+        minimum_tissue_ratio = queue_controls[3].slider(
+            "最小 tissue_ratio",
+            min_value=0.01,
+            max_value=0.90,
+            value=0.10,
+            step=0.01,
+        )
+        queue_level_width, queue_level_height = level_dimensions[queue_level]
+        estimated_tiles = (
+            max(0, queue_level_width // int(queue_patch_size))
+            * max(0, queue_level_height // int(queue_patch_size))
+        )
+        st.caption(f"生成前の最大tile数: {estimated_tiles}（空白除外前）")
+        if estimated_tiles > 2000:
+            st.warning(
+                "候補tile数が多いため、生成に時間と保存容量が必要です。"
+                "必要に応じてdownsampleの大きいlevelを選ぶか、patch_size_pxを2048にしてください。"
+            )
+        if st.button("Generate patch queue", type="primary", use_container_width=True):
+            progress = st.progress(0.0, text="patch候補を探索しています...")
+
+            def update_progress(current: int, total: int) -> None:
+                progress.progress(
+                    current / total if total else 1.0,
+                    text=f"patch候補を探索しています: {current}/{total}",
+                )
+
+            result = generate_wsi_patch_queue(
+                wsi_path=wsi_path,
+                wsi_name=uploaded_image.name,
+                patch_size=int(queue_patch_size),
+                level=int(queue_level),
+                thumbnail=thumbnail,
+                thumbnail_info=thumbnail_info,
+                target_mpp=queue_target_mpp,
+                objective_magnification=str(
+                    st.session_state.image_metadata.get("objective_magnification", "unknown")
+                ),
+                minimum_tissue_ratio=float(minimum_tissue_ratio),
+                progress_callback=update_progress,
+            )
+            st.success(
+                f"patch queueを生成しました: 採用 {result['generated']} / "
+                f"除外 {result['excluded']} / 全tile {result['total_tiles']}"
+            )
+            st.rerun()
+
+        if not queue_rows.empty:
+            completed = int(queue_rows["status"].isin(["done", "reviewed_empty"]).sum())
+            st.progress(
+                completed / len(queue_rows),
+                text=f"完了 {completed}/{len(queue_rows)}",
+            )
+            status_counts = queue_rows["status"].value_counts().to_dict()
+            st.caption(
+                " | ".join(f"{status}: {status_counts.get(status, 0)}" for status in PATCH_QUEUE_STATUSES)
+            )
+            start_options = queue_rows.index[
+                queue_rows["status"].isin(["not_started", "in_progress", "flagged"])
+            ].tolist()
+            start_index = int(start_options[0]) if start_options else 0
+            if st.button("queueを開始 / 再開", use_container_width=True):
+                row = queue_rows.iloc[start_index].to_dict()
+                patch = prepared_patch_from_manifest_row(row, wsi_path, thumbnail_info)
+                if row["status"] == "not_started":
+                    update_patch_manifest_status(uploaded_image.name, row["patch_id"], "in_progress")
+                activate_wsi_patch(patch, source_key, start_index)
+                st.rerun()
+            st.dataframe(
+                queue_rows[
+                    [
+                        "patch_id",
+                        "tissue_ratio",
+                        "status",
+                        "annotation_count",
+                        "eosinophil_count",
+                    ]
+                ],
+                hide_index=True,
+                use_container_width=True,
+            )
+        else:
+            st.info("このWSIのpatch queueはまだありません。")
+
+    st.markdown("#### 手動ROI patch")
+    st.caption("従来どおり、任意位置を確認して1枚ずつpatchを作成できます。")
 
     controls = st.columns(4)
     patch_width = controls[0].number_input("patch幅", min_value=256, max_value=4096, value=1024, step=256)
@@ -2337,7 +2835,6 @@ def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
         )
 
     if st.button("このプレビューをアノテーション用patchとして確定", use_container_width=True):
-        existing_metadata = st.session_state.image_metadata.copy()
         patch = create_wsi_patch(
             wsi_path=wsi_path,
             wsi_name=uploaded_image.name,
@@ -2349,14 +2846,8 @@ def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
             thumbnail_info=thumbnail_info,
             target_mpp=target_mpp,
         )
-        st.session_state.active_patch = patch
-        st.session_state.active_patch_source = source_key
         st.session_state.uploaded_source_name = uploaded_image.name
-        reset_for_new_image()
-        st.session_state.image_metadata.update(existing_metadata)
-        st.session_state.active_patch = patch
-        st.session_state.active_patch_source = source_key
-        apply_patch_metadata_to_session(patch["patch_metadata"])
+        activate_wsi_patch(patch, source_key)
         st.rerun()
 
     return None
@@ -2369,7 +2860,8 @@ def process_upload(
     prepared_image: dict[str, Any],
 ) -> None:
     image_key = f"{uploaded_image.name}:{uploaded_image.size}:{prepared_image['image_name']}"
-    if st.session_state.saved_image_key != image_key:
+    image_changed = st.session_state.saved_image_key != image_key
+    if image_changed:
         st.session_state.original_image_path = str(prepared_image["image_path"])
         st.session_state.saved_image_key = image_key
 
@@ -2393,6 +2885,32 @@ def process_upload(
                 st.session_state.scale_factor,
             )["objects"]
             st.session_state.restored_annotations_key = restore_key
+            st.session_state.canvas_key_version += 1
+            st.session_state.canvas_initial_drawing_pending = True
+    elif image_changed:
+        saved_path = image_export_paths(
+            str(prepared_image["image_name"]),
+            st.session_state.image_metadata,
+        )["annotations_json"]
+        payload = load_saved_annotation_payload(saved_path)
+        if payload:
+            restored = [
+                normalize_annotation_status(item)
+                for item in payload.get("annotations", [])
+            ]
+            st.session_state.annotation_table = restored
+            st.session_state.image_metadata.update(payload.get("image_metadata", {}))
+            st.session_state.region_annotations = payload.get(
+                "region_annotations",
+                default_region_annotations(),
+            )
+            st.session_state.canvas_objects = canvas_json_from_annotations(
+                restored,
+                display_image.size[0],
+                display_image.size[1],
+                st.session_state.scale_factor,
+            )["objects"]
+            st.session_state.restored_annotations_key = str(saved_path)
             st.session_state.canvas_key_version += 1
             st.session_state.canvas_initial_drawing_pending = True
 
@@ -2619,6 +3137,83 @@ def main() -> None:
             + "。MVPのため保存自体は可能です。"
         )
 
+    current_wsi_name = str(st.session_state.image_metadata.get("source_wsi_name", ""))
+    current_patch_id = str(st.session_state.image_metadata.get("patch_id", ""))
+    queue_manifest = load_patch_manifest()
+    queue_mask = (
+        (queue_manifest["source_wsi_name"] == current_wsi_name)
+        & (queue_manifest["patch_id"] == current_patch_id)
+        if not queue_manifest.empty
+        else pd.Series(dtype=bool)
+    )
+    if not queue_manifest.empty and queue_mask.any():
+        current_queue_status = str(queue_manifest.loc[queue_mask, "status"].iloc[0])
+        st.subheader("Patch queue")
+        st.caption(f"現在のstatus: {current_queue_status} | patch_id: {current_patch_id}")
+        queue_actions = st.columns(4)
+        if queue_actions[0].button("Mark done", use_container_width=True):
+            st.session_state.image_metadata["reviewed"] = True
+            st.session_state.image_metadata["exported"] = True
+            paths = save_outputs(
+                st.session_state.image_name,
+                st.session_state.original_image_path,
+                st.session_state.image_original_size,
+                export_annotations,
+                counts_df,
+                st.session_state.image_metadata,
+                st.session_state.region_annotations,
+                objective_filter,
+                exclude_ignore_from_yolo,
+                used_for_training_only_export,
+            )
+            update_patch_manifest_status(
+                current_wsi_name,
+                current_patch_id,
+                "done",
+                export_annotations,
+            )
+            st.session_state.last_saved_message = "Mark doneとして保存しました: " + str(paths["annotations_json"])
+            st.rerun()
+        if queue_actions[1].button("Mark empty", use_container_width=True):
+            st.session_state.image_metadata["reviewed"] = True
+            st.session_state.image_metadata["exported"] = True
+            empty_annotations: list[dict[str, Any]] = []
+            empty_counts = count_annotations(
+                empty_annotations,
+                st.session_state.image_metadata,
+                st.session_state.image_original_size,
+            )
+            paths = save_outputs(
+                st.session_state.image_name,
+                st.session_state.original_image_path,
+                st.session_state.image_original_size,
+                empty_annotations,
+                empty_counts,
+                st.session_state.image_metadata,
+                st.session_state.region_annotations,
+                objective_filter,
+                exclude_ignore_from_yolo,
+                used_for_training_only_export,
+            )
+            st.session_state.annotation_table = []
+            st.session_state.canvas_objects = []
+            st.session_state.canvas_key_version += 1
+            st.session_state.canvas_initial_drawing_pending = True
+            update_patch_manifest_status(
+                current_wsi_name,
+                current_patch_id,
+                "reviewed_empty",
+                empty_annotations,
+            )
+            st.session_state.last_saved_message = "陰性patchとして保存しました: " + str(paths["annotations_json"])
+            st.rerun()
+        if queue_actions[2].button("Skip", use_container_width=True):
+            update_patch_manifest_status(current_wsi_name, current_patch_id, "skipped", export_annotations)
+            st.rerun()
+        if queue_actions[3].button("Flag for review", use_container_width=True):
+            update_patch_manifest_status(current_wsi_name, current_patch_id, "flagged", export_annotations)
+            st.rerun()
+
     imported_count = sum(1 for item in st.session_state.annotation_table if item.get("candidate_source", "manual") != "manual")
     if imported_count:
         st.caption(f"現在の画像に含まれるAI候補アノテーション: {imported_count}件")
@@ -2656,6 +3251,9 @@ def main() -> None:
             only_reviewed_or_exported=only_reviewed_or_exported,
             exclude_ignore=exclude_ignore_from_yolo,
             used_for_training_only=used_for_training_only_export,
+            only_completed_patch_queue=bool(
+                st.session_state.get("export_completed_patch_queue_only", True)
+            ),
         )
         st.success(
             "YOLO datasetを生成しました: "
