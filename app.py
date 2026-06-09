@@ -398,6 +398,106 @@ def disable_canvas_context_menu() -> None:
     )
 
 
+def render_canvas_wheel_zoom() -> None:
+    """Add display-only wheel zoom to the most recently rendered drawable canvas."""
+    components.html(
+        """
+        <div style="display:flex;align-items:center;gap:8px;font-family:Arial,sans-serif;font-size:13px;">
+          <button id="zoomOut" title="縮小">−</button>
+          <button id="zoomReset" title="100%へ戻す">100%</button>
+          <button id="zoomIn" title="拡大">＋</button>
+          <span id="zoomLabel">倍率 100%</span>
+          <span style="color:#666;">画像上でマウスホイール: 拡大縮小 / スクロールバー: 移動</span>
+        </div>
+        <script>
+        (() => {
+          const parentDoc = window.parent.document;
+          const selfFrame = window.frameElement;
+          const label = document.getElementById("zoomLabel");
+          let targetFrame = null;
+          let scrollHost = null;
+          let zoom = 1;
+          const minZoom = 1;
+          const maxZoom = 4;
+
+          const findCanvasFrame = () => {
+            const frames = Array.from(parentDoc.querySelectorAll("iframe")).reverse();
+            return frames.find((frame) => {
+              if (frame === selfFrame) return false;
+              try {
+                return Boolean(frame.contentDocument?.querySelector("#canvas-to-streamlit"));
+              } catch (error) {
+                return false;
+              }
+            });
+          };
+
+          const applyZoom = (nextZoom, pointerX = 0, pointerY = 0) => {
+            if (!targetFrame || !scrollHost) return;
+            const previousZoom = zoom;
+            zoom = Math.min(maxZoom, Math.max(minZoom, nextZoom));
+            targetFrame.style.transformOrigin = "top left";
+            targetFrame.style.transform = `scale(${zoom})`;
+            targetFrame.style.marginRight = `${targetFrame.offsetWidth * (zoom - 1)}px`;
+            targetFrame.style.marginBottom = `${targetFrame.offsetHeight * (zoom - 1)}px`;
+            if (previousZoom !== zoom) {
+              const ratio = zoom / previousZoom;
+              scrollHost.scrollLeft = (scrollHost.scrollLeft + pointerX) * ratio - pointerX;
+              scrollHost.scrollTop = (scrollHost.scrollTop + pointerY) * ratio - pointerY;
+            }
+            label.textContent = `倍率 ${Math.round(zoom * 100)}%`;
+          };
+
+          const install = () => {
+            targetFrame = findCanvasFrame();
+            if (!targetFrame) return false;
+            scrollHost = targetFrame.parentElement;
+            if (!scrollHost) return false;
+            scrollHost.style.overflow = "auto";
+            scrollHost.style.maxWidth = "100%";
+            scrollHost.style.maxHeight = `${Math.min(targetFrame.offsetHeight, 900)}px`;
+
+            const canvasDocument = targetFrame.contentDocument;
+            if (!canvasDocument) return false;
+            if (!targetFrame.dataset.wheelZoomInstalled) {
+              canvasDocument.addEventListener(
+                "wheel",
+                (event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  const direction = event.deltaY < 0 ? 1 : -1;
+                  const factor = direction > 0 ? 1.15 : 1 / 1.15;
+                  applyZoom(zoom * factor, event.clientX, event.clientY);
+                },
+                { passive: false, capture: true }
+              );
+              targetFrame.dataset.wheelZoomInstalled = "true";
+            }
+            applyZoom(1);
+            return true;
+          };
+
+          document.getElementById("zoomOut").onclick = () => applyZoom(zoom / 1.25);
+          document.getElementById("zoomReset").onclick = () => {
+            applyZoom(1);
+            if (scrollHost) {
+              scrollHost.scrollLeft = 0;
+              scrollHost.scrollTop = 0;
+            }
+          };
+          document.getElementById("zoomIn").onclick = () => applyZoom(zoom * 1.25);
+
+          if (!install()) {
+            setTimeout(install, 300);
+            setTimeout(install, 900);
+          }
+        })();
+        </script>
+        """,
+        height=38,
+    )
+
+
 def ensure_directories() -> None:
     for path in (
         IMAGE_DIR,
@@ -3109,6 +3209,8 @@ def main() -> None:
         drawing_mode=drawing_mode,
         key=f"canvas_{st.session_state.image_name}_{st.session_state.canvas_key_version}",
     )
+    if prepared_image["source_format"] == "wsi_patch":
+        render_canvas_wheel_zoom()
 
     if canvas_result.json_data:
         for obj in canvas_result.json_data.get("objects", []):
