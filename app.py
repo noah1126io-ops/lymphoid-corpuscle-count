@@ -10,6 +10,8 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -23,6 +25,7 @@ from streamlit_drawable_canvas import st_canvas
 
 
 APP_TITLE = "手動好酸球アノテーションツール"
+TOKYO_TIMEZONE = ZoneInfo("Asia/Tokyo")
 
 PROJECT_TEMPLATES = [
     "ECRS_nasal_polyp",
@@ -128,6 +131,12 @@ ANNOTATION_STATUS_FIELDS = [
     "annotation_status",
     "used_for_training",
 ]
+ANNOTATION_TRACKING_FIELDS = [
+    "annotation_id",
+    "annotation_created_at",
+    "annotation_updated_at",
+    "annotation_session_id",
+]
 
 METADATA_FIELDS = [
     "project_template",
@@ -150,6 +159,8 @@ METADATA_FIELDS = [
     "section_quality",
     "reviewed",
     "exported",
+    "reviewed_at",
+    "exported_at",
     "source_wsi_name",
     "patch_id",
     "patch_x",
@@ -195,6 +206,8 @@ MANIFEST_FIELDS = [
     "exported",
     "annotation_count",
     "eosinophil_count",
+    "reviewed_at",
+    "exported_at",
     "saved_at",
 ]
 REQUIRED_METADATA_FIELDS = [
@@ -356,7 +369,10 @@ PATCH_MANIFEST_FIELDS = [
     "status",
     "annotation_count",
     "eosinophil_count",
+    "created_at",
     "updated_at",
+    "reviewed_at",
+    "exported_at",
 ]
 WSI_TILE_SIZE = 256
 WSI_TILE_SERVER_PORT = 8765
@@ -366,6 +382,29 @@ WSI_TILE_SERVER_STARTED = False
 # Research TIFF files can be very large. The app still downscales for display,
 # but Pillow needs permission to open the original dimensions first.
 Image.MAX_IMAGE_PIXELS = None
+
+
+def tokyo_now_iso() -> str:
+    return datetime.now(TOKYO_TIMEZONE).isoformat(timespec="seconds")
+
+
+def normalize_tokyo_timestamp(value: Any, fallback: str | None = None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return fallback or tokyo_now_iso()
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return fallback or tokyo_now_iso()
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=TOKYO_TIMEZONE)
+    else:
+        parsed = parsed.astimezone(TOKYO_TIMEZONE)
+    return parsed.isoformat(timespec="seconds")
+
+
+def new_annotation_session_id() -> str:
+    return f"session_{uuid4().hex}"
 
 
 def patch_drawable_canvas_for_streamlit() -> None:
@@ -561,6 +600,8 @@ def default_image_metadata(project_template: str = "ECRS_nasal_polyp") -> dict[s
         "section_quality": "good",
         "reviewed": False,
         "exported": False,
+        "reviewed_at": "",
+        "exported_at": "",
         "source_wsi_name": "",
         "patch_id": "",
         "patch_x": "",
@@ -608,6 +649,7 @@ def init_session_state() -> None:
         "active_patch_queue_id": None,
         "patch_queue_index": 0,
         "patch_queue_sort_by": "priority_score",
+        "annotation_session_id": new_annotation_session_id(),
         "project_template": "ECRS_nasal_polyp",
         "image_metadata": default_image_metadata("ECRS_nasal_polyp"),
         "region_annotations": default_region_annotations(),
@@ -1306,7 +1348,7 @@ def cluster_patch_manifest(source_wsi_name: str, cluster_count: int) -> int:
         ).fit_predict(scaled_features)
 
     manifest.loc[valid_features.index, "cluster_id"] = labels.astype(str)
-    manifest.loc[source_mask, "updated_at"] = datetime.now().isoformat(timespec="seconds")
+    manifest.loc[source_mask, "updated_at"] = tokyo_now_iso()
     save_patch_manifest(manifest)
     return resolved_cluster_count
 
@@ -1337,7 +1379,7 @@ def recalculate_patch_features(source_wsi_name: str, cluster_count: int) -> dict
             manifest.loc[index, field] = f"{value:.6f}"
         manifest.loc[index, "priority_score"] = f"{priority_score:.6f}"
         manifest.loc[index, "feature_version"] = PATCH_FEATURE_VERSION
-        manifest.loc[index, "updated_at"] = datetime.now().isoformat(timespec="seconds")
+        manifest.loc[index, "updated_at"] = tokyo_now_iso()
         updated += 1
 
     save_patch_manifest(manifest)
@@ -1355,6 +1397,10 @@ def load_patch_manifest() -> pd.DataFrame:
     for field in PATCH_MANIFEST_FIELDS:
         if field not in manifest.columns:
             manifest[field] = ""
+    for field in ("created_at", "updated_at", "reviewed_at", "exported_at"):
+        manifest[field] = manifest[field].map(
+            lambda value: normalize_tokyo_timestamp(value, "") if str(value).strip() else ""
+        )
     return manifest[PATCH_MANIFEST_FIELDS]
 
 
@@ -1415,7 +1461,10 @@ def update_patch_manifest_status(
     if not mask.any():
         return
     manifest.loc[mask, "status"] = status
-    manifest.loc[mask, "updated_at"] = datetime.now().isoformat(timespec="seconds")
+    now = tokyo_now_iso()
+    manifest.loc[mask, "updated_at"] = now
+    if status in {"done", "reviewed_empty"}:
+        manifest.loc[mask, "reviewed_at"] = now
     if annotations is not None:
         manifest.loc[mask, "annotation_count"] = str(len(annotations))
         manifest.loc[mask, "eosinophil_count"] = str(
@@ -1439,7 +1488,7 @@ def update_patch_manifest_counts(
     manifest.loc[mask, "eosinophil_count"] = str(
         sum(1 for item in annotations if item.get("label") == "eosinophil")
     )
-    manifest.loc[mask, "updated_at"] = datetime.now().isoformat(timespec="seconds")
+    manifest.loc[mask, "updated_at"] = tokyo_now_iso()
     save_patch_manifest(manifest)
 
 
@@ -1546,7 +1595,10 @@ def generate_wsi_patch_queue(
                     "status": previous.get("status", "not_started"),
                     "annotation_count": previous.get("annotation_count", "0"),
                     "eosinophil_count": previous.get("eosinophil_count", "0"),
-                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+                    "created_at": previous.get("created_at", "") or tokyo_now_iso(),
+                    "updated_at": tokyo_now_iso(),
+                    "reviewed_at": previous.get("reviewed_at", ""),
+                    "exported_at": previous.get("exported_at", ""),
                 }
             )
             if progress_callback:
@@ -1614,6 +1666,9 @@ def prepared_patch_from_manifest_row(
             "target_mpp": row.get("target_mpp", ""),
             "mpp_x": thumbnail_info.get("mpp_x", ""),
             "mpp_y": thumbnail_info.get("mpp_y", ""),
+            "reviewed_at": row.get("reviewed_at", ""),
+            "exported_at": row.get("exported_at", ""),
+            "patch_status": row.get("status", ""),
         },
     }
 
@@ -1711,6 +1766,12 @@ def normalize_canvas_object(
     default_status = "confirmed_by_human" if candidate_source == "manual" else "candidate_unconfirmed"
     annotation_status = obj.get("annotation_status", default_status)
     used_for_training = safe_bool(obj.get("used_for_training"), candidate_source == "manual")
+    annotation_created_at = normalize_tokyo_timestamp(
+        obj.get("annotation_created_at")
+        or obj.get("created_at")
+        or created_at,
+        created_at,
+    )
 
     return {
         "image_name": image_name,
@@ -1734,7 +1795,14 @@ def normalize_canvas_object(
         "source_model": obj.get("source_model", ""),
         "source_image_name": obj.get("source_image_name", image_name),
         "confidence": safe_float(obj.get("confidence"), 1.0),
-        "created_at": obj.get("created_at", created_at),
+        "annotation_id": obj.get("annotation_id") or f"ann_{uuid4().hex}",
+        "annotation_created_at": annotation_created_at,
+        "annotation_updated_at": obj.get("annotation_updated_at", annotation_created_at),
+        "annotation_session_id": (
+            obj.get("annotation_session_id")
+            or st.session_state.get("annotation_session_id", "")
+        ),
+        "created_at": annotation_created_at,
     }
 
 
@@ -1748,7 +1816,7 @@ def annotations_from_canvas(
     if not canvas_json or not image_name:
         return []
 
-    created_at = datetime.now().isoformat(timespec="seconds")
+    created_at = tokyo_now_iso()
     annotations = []
     for obj in canvas_json.get("objects", []):
         annotation = normalize_canvas_object(
@@ -1823,6 +1891,22 @@ def normalize_annotation_status(annotation: dict[str, Any]) -> dict[str, Any]:
     normalized["candidate_source"] = source
     normalized["annotation_status"] = status
     normalized["used_for_training"] = used_for_training
+    fallback_time = normalize_tokyo_timestamp(
+        normalized.get("annotation_created_at")
+        or normalized.get("created_at")
+        or tokyo_now_iso()
+    )
+    normalized["annotation_id"] = normalized.get("annotation_id") or f"ann_{uuid4().hex}"
+    normalized["annotation_created_at"] = fallback_time
+    normalized["annotation_updated_at"] = (
+        normalize_tokyo_timestamp(normalized.get("annotation_updated_at"), fallback_time)
+    )
+    normalized["annotation_session_id"] = (
+        normalized.get("annotation_session_id")
+        or st.session_state.get("annotation_session_id", "")
+        or new_annotation_session_id()
+    )
+    normalized["created_at"] = normalized.get("created_at") or fallback_time
     return normalized
 
 
@@ -1889,7 +1973,11 @@ def fabric_object_from_annotation(annotation: dict[str, Any], scale_factor: floa
         "source_model": annotation.get("source_model", ""),
         "source_image_name": annotation.get("source_image_name", annotation.get("image_name", "")),
         "confidence": safe_float(annotation.get("confidence"), 1.0),
-        "created_at": annotation.get("created_at", datetime.now().isoformat(timespec="seconds")),
+        "annotation_id": annotation.get("annotation_id", ""),
+        "annotation_created_at": annotation.get("annotation_created_at", annotation.get("created_at", "")),
+        "annotation_updated_at": annotation.get("annotation_updated_at", ""),
+        "annotation_session_id": annotation.get("annotation_session_id", ""),
+        "created_at": annotation.get("created_at", tokyo_now_iso()),
     }
 
 
@@ -2012,7 +2100,7 @@ def imported_candidate_annotations(
     metadata: dict[str, Any],
     fallback_source: str,
 ) -> list[dict[str, Any]]:
-    imported_at = datetime.now().isoformat(timespec="seconds")
+    imported_at = tokyo_now_iso()
     annotations = []
     for row in candidate_rows_from_file(uploaded_file):
         annotation = normalize_imported_candidate(row, image_name, metadata, fallback_source, imported_at)
@@ -2083,8 +2171,12 @@ def count_annotations(
 
 def annotations_dataframe(annotations: list[dict[str, Any]]) -> pd.DataFrame:
     if not annotations:
-        return pd.DataFrame()
-    return pd.DataFrame(annotations)
+        return pd.DataFrame(columns=ANNOTATION_TRACKING_FIELDS)
+    frame = pd.DataFrame(annotations)
+    for field in ANNOTATION_TRACKING_FIELDS:
+        if field not in frame.columns:
+            frame[field] = ""
+    return frame
 
 
 def counts_with_metadata(
@@ -2098,7 +2190,25 @@ def counts_with_metadata(
         counts_with_context[field] = metadata.get(field, "")
     counts_with_context["global_region_type"] = region_annotations.get("global_region_type", "unknown")
     counts_with_context["export_objective_filter"] = objective_filter
+    counts_with_context["reviewed_at"] = metadata.get("reviewed_at", "")
+    counts_with_context["exported_at"] = metadata.get("exported_at", "")
     return counts_with_context
+
+
+def patch_timestamps(source_wsi_name: str, patch_id: str) -> dict[str, str]:
+    if not source_wsi_name or not patch_id:
+        return {"created_at": "", "updated_at": "", "reviewed_at": "", "exported_at": ""}
+    manifest = load_patch_manifest()
+    if manifest.empty:
+        return {"created_at": "", "updated_at": "", "reviewed_at": "", "exported_at": ""}
+    mask = (manifest["source_wsi_name"] == source_wsi_name) & (manifest["patch_id"] == patch_id)
+    if not mask.any():
+        return {"created_at": "", "updated_at": "", "reviewed_at": "", "exported_at": ""}
+    row = manifest.loc[mask].iloc[0]
+    return {
+        field: str(row.get(field, ""))
+        for field in ("created_at", "updated_at", "reviewed_at", "exported_at")
+    }
 
 
 def dataset_manifest_row(
@@ -2112,6 +2222,10 @@ def dataset_manifest_row(
 ) -> dict[str, Any]:
     ecrs_counts = calculate_ecrs_counts(annotations, metadata, image_size)
     export_paths = export_paths or image_export_paths(image_name, metadata)
+    timestamps = patch_timestamps(
+        str(metadata.get("source_wsi_name", "")),
+        str(metadata.get("patch_id", "")),
+    )
     return {
         "image_name": image_name,
         "original_image_path": original_image_path,
@@ -2142,6 +2256,8 @@ def dataset_manifest_row(
         "exported": bool(metadata.get("exported", False)),
         "annotation_count": len(annotations),
         "eosinophil_count": ecrs_counts["eosinophil_count"],
+        "reviewed_at": metadata.get("reviewed_at", "") or timestamps["reviewed_at"],
+        "exported_at": metadata.get("exported_at", "") or timestamps["exported_at"],
         "saved_at": saved_at,
     }
 
@@ -2232,6 +2348,13 @@ def generate_yolo_training_dataset(
 
     for payload in saved_annotation_payloads():
         metadata = payload.get("image_metadata", {})
+        metadata = metadata.copy()
+        timestamps = patch_timestamps(
+            str(metadata.get("source_wsi_name", "")),
+            str(metadata.get("patch_id", "")),
+        )
+        metadata["reviewed_at"] = metadata.get("reviewed_at", "") or timestamps["reviewed_at"]
+        metadata["exported_at"] = timestamps["exported_at"] or metadata.get("exported_at", "")
         if only_reviewed_or_exported and not (metadata.get("reviewed") or metadata.get("exported")):
             skipped_images.append(payload.get("image_name", "unknown"))
             continue
@@ -2271,10 +2394,18 @@ def generate_yolo_training_dataset(
             ),
             encoding="utf-8",
         )
+        exported_at = tokyo_now_iso()
+        mark_patch_exported(
+            str(metadata.get("source_wsi_name", "")),
+            str(metadata.get("patch_id", "")),
+            exported_at,
+            str(metadata.get("reviewed_at", "")),
+        )
         exported_images += 1
         exported_labels += 1
 
     yaml_path = write_data_yaml()
+    regenerate_dataset_exports()
     return {
         "images": exported_images,
         "labels": exported_labels,
@@ -2315,6 +2446,14 @@ def generate_clam_compatible_export(
         skipped = int((~completed_mask).sum())
         export_manifest = export_manifest.loc[completed_mask].copy()
 
+    clam_exported_at = tokyo_now_iso()
+    if not export_manifest.empty:
+        manifest.loc[export_manifest.index, "exported_at"] = clam_exported_at
+        manifest.loc[export_manifest.index, "updated_at"] = clam_exported_at
+        export_manifest.loc[:, "exported_at"] = clam_exported_at
+        export_manifest.loc[:, "updated_at"] = clam_exported_at
+        save_patch_manifest(manifest)
+
     metadata_lookup = slide_metadata_by_wsi()
     patch_manifest_rows: list[dict[str, Any]] = []
     slide_label_rows: list[dict[str, Any]] = []
@@ -2341,6 +2480,10 @@ def generate_clam_compatible_export(
                 "patch_downsample",
                 "target_mpp",
                 "status",
+                "created_at",
+                "updated_at",
+                "reviewed_at",
+                "exported_at",
             ]
         ].copy()
         coords = coords.rename(columns={"patch_x": "x", "patch_y": "y"})
@@ -2360,6 +2503,8 @@ def generate_clam_compatible_export(
                 "cluster_id",
                 "priority_score",
                 "feature_version",
+                "reviewed_at",
+                "exported_at",
             ]
         ].copy()
         features.insert(0, "slide_id", slide_id)
@@ -2382,6 +2527,14 @@ def generate_clam_compatible_export(
                 "patient_id_hash": patient_id_hash,
                 "wsi_path": str(wsi_path),
                 "patch_count": len(slide_rows),
+                "reviewed_at": max(
+                    (str(value) for value in slide_rows["reviewed_at"] if str(value)),
+                    default="",
+                ),
+                "exported_at": max(
+                    (str(value) for value in slide_rows["exported_at"] if str(value)),
+                    default="",
+                ),
             }
         )
         process_rows.append(
@@ -2394,6 +2547,14 @@ def generate_clam_compatible_export(
                 "patch_count": len(slide_rows),
                 "coords_csv": str(CLAM_COORD_DIR / f"{slide_stem}.csv"),
                 "features_csv": str(CLAM_FEATURE_DIR / f"{slide_stem}.csv"),
+                "reviewed_at": max(
+                    (str(value) for value in slide_rows["reviewed_at"] if str(value)),
+                    default="",
+                ),
+                "exported_at": max(
+                    (str(value) for value in slide_rows["exported_at"] if str(value)),
+                    default="",
+                ),
             }
         )
 
@@ -2426,6 +2587,7 @@ def generate_clam_compatible_export(
         index=False,
         encoding="utf-8-sig",
     )
+    regenerate_dataset_exports()
     return {
         "slides": len(slide_label_rows),
         "patches": len(patch_manifest_rows),
@@ -2689,7 +2851,13 @@ def regenerate_dataset_exports() -> None:
     for payload in payloads:
         image_name = payload.get("image_name", "")
         original_image_path = payload.get("original_image_path", "")
-        metadata = payload.get("image_metadata", {})
+        metadata = payload.get("image_metadata", {}).copy()
+        timestamps = patch_timestamps(
+            str(metadata.get("source_wsi_name", "")),
+            str(metadata.get("patch_id", "")),
+        )
+        metadata["reviewed_at"] = metadata.get("reviewed_at", "") or timestamps["reviewed_at"]
+        metadata["exported_at"] = timestamps["exported_at"] or metadata.get("exported_at", "")
         region_annotations = payload.get("region_annotations", default_region_annotations())
         annotations = payload.get("annotations", [])
         saved_at = payload.get("saved_at", "")
@@ -2715,6 +2883,11 @@ def regenerate_dataset_exports() -> None:
             metadata,
             region_annotations,
             payload.get("export_objective_filter", "all"),
+        )
+        counts_context.to_csv(
+            export_paths["counts_csv"],
+            index=False,
+            encoding="utf-8-sig",
         )
         counts_context.insert(0, "image_name", image_name)
         counts_context["saved_at"] = saved_at
@@ -2746,6 +2919,54 @@ def regenerate_dataset_exports() -> None:
         pd.DataFrame().to_csv(EXPORT_DIR / "counts.csv", index=False, encoding="utf-8-sig")
 
 
+def annotations_for_save(
+    annotations: list[dict[str, Any]],
+    saved_at: str,
+) -> list[dict[str, Any]]:
+    stamped = []
+    for annotation in annotations:
+        normalized = normalize_annotation_status(annotation)
+        normalized["annotation_created_at"] = (
+            normalized.get("annotation_created_at")
+            or normalized.get("created_at")
+            or saved_at
+        )
+        normalized["annotation_updated_at"] = saved_at
+        normalized["annotation_session_id"] = (
+            st.session_state.get("annotation_session_id", "")
+            or normalized.get("annotation_session_id")
+            or new_annotation_session_id()
+        )
+        normalized["created_at"] = (
+            normalized.get("created_at")
+            or normalized["annotation_created_at"]
+        )
+        stamped.append(normalized)
+    return stamped
+
+
+def mark_patch_exported(
+    source_wsi_name: str,
+    patch_id: str,
+    exported_at: str,
+    reviewed_at: str = "",
+) -> None:
+    if not source_wsi_name or not patch_id:
+        return
+    manifest = load_patch_manifest()
+    if manifest.empty:
+        return
+    mask = (manifest["source_wsi_name"] == source_wsi_name) & (manifest["patch_id"] == patch_id)
+    if not mask.any():
+        return
+    manifest.loc[mask, "updated_at"] = exported_at
+    manifest.loc[mask, "exported_at"] = exported_at
+    if reviewed_at:
+        empty_reviewed = manifest.loc[mask, "reviewed_at"].eq("")
+        manifest.loc[manifest.loc[mask].index[empty_reviewed], "reviewed_at"] = reviewed_at
+    save_patch_manifest(manifest)
+
+
 def save_outputs(
     image_name: str,
     original_image_path: str,
@@ -2758,7 +2979,17 @@ def save_outputs(
     exclude_ignore_from_yolo: bool,
     used_for_training_only_export: bool,
 ) -> dict[str, Path]:
-    saved_at = datetime.now().isoformat(timespec="seconds")
+    saved_at = tokyo_now_iso()
+    annotations = annotations_for_save(annotations, saved_at)
+    metadata["exported_at"] = saved_at
+    if metadata.get("reviewed") and not metadata.get("reviewed_at"):
+        metadata["reviewed_at"] = saved_at
+    mark_patch_exported(
+        str(metadata.get("source_wsi_name", "")),
+        str(metadata.get("patch_id", "")),
+        saved_at,
+        str(metadata.get("reviewed_at", "")),
+    )
     paths = image_export_paths(image_name, metadata)
     export_stem = export_file_stem(image_name, metadata)
     manifest_path = EXPORT_DIR / "dataset_manifest.csv"
@@ -2767,7 +2998,7 @@ def save_outputs(
     metadata_path = EXPORT_DIR / "metadata.csv"
 
     payload = {
-        "schema_version": "2.3",
+        "schema_version": "2.4",
         "image_name": image_name,
         "original_image_path": original_image_path,
         "export_file_stem": export_stem,
@@ -3053,6 +3284,7 @@ def reset_for_new_image() -> None:
     st.session_state.saved_image_key = None
     st.session_state.image_metadata = default_image_metadata(st.session_state.project_template)
     st.session_state.region_annotations = default_region_annotations()
+    st.session_state.annotation_session_id = new_annotation_session_id()
     st.session_state.canvas_key_version += 1
     st.session_state.canvas_initial_drawing_pending = True
 
@@ -3166,8 +3398,11 @@ def activate_wsi_patch(
     existing_metadata = st.session_state.image_metadata.copy()
     reset_for_new_image()
     st.session_state.image_metadata.update(existing_metadata)
-    st.session_state.image_metadata["reviewed"] = False
-    st.session_state.image_metadata["exported"] = False
+    patch_status = patch.get("patch_metadata", {}).get("patch_status", "")
+    st.session_state.image_metadata["reviewed"] = patch_status in {"done", "reviewed_empty"}
+    st.session_state.image_metadata["exported"] = bool(
+        patch.get("patch_metadata", {}).get("exported_at", "")
+    )
     st.session_state.active_patch = patch
     st.session_state.active_patch_source = source_key
     st.session_state.active_patch_queue_id = patch.get("patch_metadata", {}).get("patch_id")
@@ -3781,7 +4016,15 @@ def main() -> None:
     if canvas_result.json_data:
         for obj in canvas_result.json_data.get("objects", []):
             obj.setdefault("label", active_label)
-            obj.setdefault("created_at", datetime.now().isoformat(timespec="seconds"))
+            created_at = tokyo_now_iso()
+            obj.setdefault("annotation_id", f"ann_{uuid4().hex}")
+            obj.setdefault("annotation_created_at", obj.get("created_at", created_at))
+            obj.setdefault("annotation_updated_at", obj["annotation_created_at"])
+            obj.setdefault(
+                "annotation_session_id",
+                st.session_state.annotation_session_id,
+            )
+            obj.setdefault("created_at", obj["annotation_created_at"])
 
         st.session_state.canvas_objects = canvas_result.json_data.get("objects", [])
         st.session_state.annotation_table = annotations_from_canvas(
@@ -4093,7 +4336,7 @@ def main() -> None:
             st.warning(warning)
 
     download_payload = {
-        "schema_version": "2.3",
+        "schema_version": "2.4",
         "image_name": st.session_state.image_name,
         "original_image_path": st.session_state.original_image_path,
         "labels": LABELS,

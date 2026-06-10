@@ -237,6 +237,34 @@ NDPI全体を巨大TIFFへ変換する必要はありません。元WSIとlevel 
 
 `CLAM-compatible CSV stagingの整合性を確認しました`と表示されても、slide-level labelの医学的妥当性やtrain/validation分割のリークまでは検証しません。これらはMIL/CLAM学習前に別途確認してください。
 
+### 日時・annotation履歴
+
+研究データの作成・確認・export時刻は、Asia/TokyoのISO 8601形式で自動保存します。
+
+```text
+2026-06-10T17:30:00+09:00
+```
+
+`data/patches/patch_manifest.csv`:
+
+- `created_at`: patch queueへ初めて登録された時刻
+- `updated_at`: status、annotation count、feature、exportなどが最後に更新された時刻
+- `reviewed_at`: `done`または`reviewed_empty`として人が確認した時刻
+- `exported_at`: annotation、YOLO dataset、CLAM-compatible dataなどへ最後にexportされた時刻
+
+`skipped`、`flagged`、`in_progress`へのstatus変更でも`updated_at`は更新されます。古いpatch manifestにこれらの列がない場合は、読み込み時に空欄で補完されます。`reviewed_empty`はannotation行が0件でも、`reviewed_at`により人間確認済みであることを追跡できます。
+
+annotation JSON/CSV:
+
+- `annotation_id`: annotationごとのUUID
+- `annotation_created_at`: annotationを作成した時刻
+- `annotation_updated_at`: annotationを最後に保存した時刻
+- `annotation_session_id`: 同じアノテーション作業セッションを識別するID
+
+既存annotationに`annotation_created_at`がない場合は、従来の`created_at`または保存時刻から補完します。再保存時には`annotation_id`と`annotation_created_at`を保持し、`annotation_updated_at`だけを現在時刻へ更新します。
+
+`counts.csv`、`dataset_manifest.csv`、CLAM-compatibleのpatch manifest、coords、features、slide labels、process listにも`reviewed_at`と`exported_at`を含めます。
+
 ## Multi-Tissue Eosinophil Reference Dataset
 
 副鼻腔炎画像が届くまで、肝臓など他臓器H&E画像を含む汎用好酸球reference datasetを作成できます。`project_template` と `source_organ` で、ECRS本命データと汎用referenceデータを分けて管理してください。
