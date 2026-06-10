@@ -188,6 +188,35 @@ queueの並び順:
 
 将来的には、各patchの埋め込みベクトルをHDF5やNumPy形式で保存し、CLAM-compatible feature export、attention scoreのimport、cluster/attentionに基づくsamplingへ拡張する予定です。
 
+### CLAM-compatible export
+
+「CLAM-compatibleデータを生成」を押すと、現在のpatch queueと軽量patch featureを`data/clam/`へ書き出します。torchやCLAM本体は使用せず、後からCLAM/MIL用の深層特徴抽出へ進むためのCSV staging structureを作成します。
+
+```text
+data/clam/
+├── patch_manifest.csv
+├── slide_labels.csv
+├── process_list_autogen.csv
+├── coords/
+│   └── <slide_stem>.csv
+└── features/
+    └── <slide_stem>.csv
+```
+
+- `patch_manifest.csv`: 全slideのpatch、座標、status、軽量特徴量、cluster、priority、WSIパスをまとめた表
+- `coords/<slide>.csv`: slide単位のlevel 0座標、patchサイズ、level、downsample、target mpp
+- `features/<slide>.csv`: 現在のRGB/HSV特徴量、cluster ID、priority score
+- `slide_labels.csv`: `case_id`, `slide_id`, `label`, WSIパス、症例・臓器メタデータ
+- `process_list_autogen.csv`: 後続のpatch/feature処理対象を管理するslide一覧
+
+slide-level `label`には、保存済み画像メタデータの`disease_context`を使用します。`case_id`は`patient_id_hash`、`specimen_id`、`slide_id`の順で利用可能な値を採用します。学習前に、研究目的に合ったslide labelであることを必ず確認してください。
+
+「patch queueは done / reviewed_empty のみ」が有効な場合、CLAM-compatible exportも人間が確認済みのpatchだけを対象にします。`reviewed_empty`は好酸球0件の確認済みpatchとしてMIL bagに含められます。
+
+この`features/*.csv`はCLAMの深層埋め込みではありません。次段階では、`process_list_autogen.csv`と`coords/*.csv`を入力として、各patchをResNetなどのfeature encoderへ渡し、CLAMが利用するHDF5またはPyTorch feature filesを生成します。その後、`slide_labels.csv`を用いてslide-level MIL/CLAM学習へ接続します。
+
+NDPI全体を巨大TIFFへ変換する必要はありません。元WSIとlevel 0座標を保持したまま、必要なpatchだけをOpenSlideから読み出す設計です。
+
 ## Multi-Tissue Eosinophil Reference Dataset
 
 副鼻腔炎画像が届くまで、肝臓など他臓器H&E画像を含む汎用好酸球reference datasetを作成できます。`project_template` と `source_organ` で、ECRS本命データと汎用referenceデータを分けて管理してください。

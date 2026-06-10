@@ -14,6 +14,7 @@ data/exports/yolo_labels/*
 data/dataset/*
 data/patches/*
 data/patches/images/*
+data/clam/*
 !data/images/.gitkeep
 !data/annotations/.gitkeep
 !data/exports/.gitkeep
@@ -27,3 +28,9 @@ data/patches/images/*
 !data/patches/
 !data/patches/images/
 !data/patches/images/.gitkeep
+!data/clam/
+!data/clam/.gitkeep
+!data/clam/coords/
+!data/clam/coords/.gitkeep
+!data/clam/features/
+!data/clam/features/.gitkeep

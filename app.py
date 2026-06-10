@@ -302,6 +302,9 @@ YOLO_DIR = EXPORT_DIR / "yolo_labels"
 DATASET_DIR = DATA_DIR / "dataset"
 DATASET_IMAGE_DIR = DATASET_DIR / "images"
 DATASET_LABEL_DIR = DATASET_DIR / "labels"
+CLAM_DIR = DATA_DIR / "clam"
+CLAM_COORD_DIR = CLAM_DIR / "coords"
+CLAM_FEATURE_DIR = CLAM_DIR / "features"
 MAX_DISPLAY_WIDTH = 1100
 MAX_DISPLAY_HEIGHT = 900
 NDPI_EXTENSIONS = {".ndpi"}
@@ -530,6 +533,8 @@ def ensure_directories() -> None:
         YOLO_DIR,
         DATASET_IMAGE_DIR,
         DATASET_LABEL_DIR,
+        CLAM_COORD_DIR,
+        CLAM_FEATURE_DIR,
     ):
         path.mkdir(parents=True, exist_ok=True)
 
@@ -2278,6 +2283,160 @@ def generate_yolo_training_dataset(
     }
 
 
+def slide_metadata_by_wsi() -> dict[str, dict[str, Any]]:
+    """Collect the latest saved image metadata for each source WSI."""
+    metadata_lookup: dict[str, dict[str, Any]] = {}
+    for payload in saved_annotation_payloads():
+        metadata = payload.get("image_metadata", {})
+        source_wsi_name = str(metadata.get("source_wsi_name", "")).strip()
+        if source_wsi_name:
+            metadata_lookup[source_wsi_name] = metadata
+    return metadata_lookup
+
+
+def generate_clam_compatible_export(
+    only_completed_patches: bool = True,
+) -> dict[str, Any]:
+    """Export CSV staging data for later CLAM/MIL feature extraction."""
+    ensure_directories()
+    manifest = load_patch_manifest()
+    if manifest.empty:
+        return {
+            "slides": 0,
+            "patches": 0,
+            "skipped": 0,
+            "clam_dir": CLAM_DIR,
+        }
+
+    export_manifest = manifest.copy()
+    skipped = 0
+    if only_completed_patches:
+        completed_mask = export_manifest["status"].isin(["done", "reviewed_empty"])
+        skipped = int((~completed_mask).sum())
+        export_manifest = export_manifest.loc[completed_mask].copy()
+
+    metadata_lookup = slide_metadata_by_wsi()
+    patch_manifest_rows: list[dict[str, Any]] = []
+    slide_label_rows: list[dict[str, Any]] = []
+    process_rows: list[dict[str, Any]] = []
+
+    for source_wsi_name, slide_rows in export_manifest.groupby("source_wsi_name", sort=True):
+        metadata = metadata_lookup.get(source_wsi_name, {})
+        slide_stem = safe_file_stem(Path(source_wsi_name).stem)
+        slide_id = str(metadata.get("slide_id", "")).strip() or slide_stem
+        specimen_id = str(metadata.get("specimen_id", "")).strip()
+        patient_id_hash = str(metadata.get("patient_id_hash", "")).strip()
+        case_id = patient_id_hash or specimen_id or slide_id
+        label = str(metadata.get("disease_context", "")).strip() or "unknown"
+        wsi_path = ORIGINAL_WSI_DIR / source_wsi_name
+
+        coords = slide_rows[
+            [
+                "patch_id",
+                "patch_x",
+                "patch_y",
+                "patch_width",
+                "patch_height",
+                "patch_level",
+                "patch_downsample",
+                "target_mpp",
+                "status",
+            ]
+        ].copy()
+        coords = coords.rename(columns={"patch_x": "x", "patch_y": "y"})
+        coords.insert(0, "slide_id", slide_id)
+        coords.to_csv(
+            CLAM_COORD_DIR / f"{slide_stem}.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+
+        features = slide_rows[
+            [
+                "patch_id",
+                "patch_x",
+                "patch_y",
+                *PATCH_FEATURE_FIELDS,
+                "cluster_id",
+                "priority_score",
+                "feature_version",
+            ]
+        ].copy()
+        features.insert(0, "slide_id", slide_id)
+        features.to_csv(
+            CLAM_FEATURE_DIR / f"{slide_stem}.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+
+        slide_label_rows.append(
+            {
+                "case_id": case_id,
+                "slide_id": slide_id,
+                "source_wsi_name": source_wsi_name,
+                "label": label,
+                "project_template": metadata.get("project_template", ""),
+                "source_organ": metadata.get("source_organ", ""),
+                "tissue_type": metadata.get("tissue_type", ""),
+                "specimen_id": specimen_id,
+                "patient_id_hash": patient_id_hash,
+                "wsi_path": str(wsi_path),
+                "patch_count": len(slide_rows),
+            }
+        )
+        process_rows.append(
+            {
+                "slide_id": slide_id,
+                "source_wsi_name": source_wsi_name,
+                "slide_path": str(wsi_path),
+                "process": 1,
+                "status": "tbp",
+                "patch_count": len(slide_rows),
+                "coords_csv": str(CLAM_COORD_DIR / f"{slide_stem}.csv"),
+                "features_csv": str(CLAM_FEATURE_DIR / f"{slide_stem}.csv"),
+            }
+        )
+
+        for _, patch_row in slide_rows.iterrows():
+            exported_row = patch_row.to_dict()
+            exported_row.update(
+                {
+                    "case_id": case_id,
+                    "slide_id": slide_id,
+                    "slide_label": label,
+                    "wsi_path": str(wsi_path),
+                    "coords_csv": str(CLAM_COORD_DIR / f"{slide_stem}.csv"),
+                    "features_csv": str(CLAM_FEATURE_DIR / f"{slide_stem}.csv"),
+                }
+            )
+            patch_manifest_rows.append(exported_row)
+
+    pd.DataFrame(patch_manifest_rows).to_csv(
+        CLAM_DIR / "patch_manifest.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    pd.DataFrame(slide_label_rows).to_csv(
+        CLAM_DIR / "slide_labels.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    pd.DataFrame(process_rows).to_csv(
+        CLAM_DIR / "process_list_autogen.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    return {
+        "slides": len(slide_label_rows),
+        "patches": len(patch_manifest_rows),
+        "skipped": skipped,
+        "clam_dir": CLAM_DIR,
+        "patch_manifest": CLAM_DIR / "patch_manifest.csv",
+        "slide_labels": CLAM_DIR / "slide_labels.csv",
+        "process_list": CLAM_DIR / "process_list_autogen.csv",
+    }
+
+
 def safe_file_stem(value: str) -> str:
     safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("._")
     return safe_stem or "unknown"
@@ -3707,6 +3866,20 @@ def main() -> None:
         )
         if dataset_result["skipped"]:
             st.warning("スキップした画像: " + ", ".join(dataset_result["skipped"]))
+
+    if st.button("CLAM-compatibleデータを生成", use_container_width=True):
+        clam_result = generate_clam_compatible_export(
+            only_completed_patches=bool(
+                st.session_state.get("export_completed_patch_queue_only", True)
+            )
+        )
+        st.success(
+            "CLAM-compatibleデータを生成しました: "
+            f"slide {clam_result['slides']}件、patch {clam_result['patches']}件、"
+            f"出力先: {clam_result['clam_dir']}"
+        )
+        if clam_result["skipped"]:
+            st.caption(f"未完了のため除外したpatch: {clam_result['skipped']}件")
 
     download_payload = {
         "schema_version": "2.3",
