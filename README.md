@@ -237,6 +237,50 @@ NDPI全体を巨大TIFFへ変換する必要はありません。元WSIとlevel 
 
 `CLAM-compatible CSV stagingの整合性を確認しました`と表示されても、slide-level labelの医学的妥当性やtrain/validation分割のリークまでは検証しません。これらはMIL/CLAM学習前に別途確認してください。
 
+#### Deep feature extraction
+
+`scripts/extract_deep_features.py`は、CLAM/MIL学習へ渡す前段階として、`process_list_autogen.csv`で`process=1`になっているslideのpatch embeddingを生成します。Streamlitアプリ本体やCLAM本体のtrainingではありません。
+
+PyTorch関連の依存は通常アプリから分離しています。ML用環境へ次を追加してください。
+
+```bash
+pip install -r requirements-ml.txt
+```
+
+ResNet18をCPUで実行する基本例:
+
+```bash
+python scripts/extract_deep_features.py --encoder resnet18 --device cpu
+```
+
+初回実行時はtorchvisionの事前学習済みweightsをダウンロードするため、インターネット接続が必要になる場合があります。既存出力は自動的にスキップします。再生成する場合は`--overwrite`を付けます。
+
+```bash
+python scripts/extract_deep_features.py --encoder resnet18 --device cpu --overwrite
+```
+
+主なオプション:
+
+- `--encoder resnet18|resnet50`: feature encoderを選択
+- `--device cpu|cuda|auto`: 実行deviceを選択
+- `--batch-size 16`: 一度にencoderへ渡すpatch数
+- `--no-pt`: `.pt`出力を作らずCSVだけ保存
+- `--no-pretrained`: weights downloadを行わないpipeline動作確認用。学習用featureには使用しない
+
+処理はNDPI/WSI全体をTIFFへ変換しません。`coords/<slide>.csv`のlevel 0座標`x`, `y`を使い、`patch_level`と`patch_width`, `patch_height`を指定してOpenSlideから必要領域だけを読み出します。読み出したRGB patchを224 x 224へresizeし、ResNetの最終分類層を除いたembeddingを保存します。
+
+```text
+data/clam/
+├── deep_features_csv/
+│   └── <slide_id>.csv
+└── deep_features/
+    └── <slide_id>.pt
+```
+
+CSVにはslide/patch ID、座標、patch size、level、target mpp、encoder情報と`feature_0`以降のembedding列が入ります。ResNet18は512次元、ResNet50は2048次元です。`.pt`にはfeature tensor、patch ID、座標、encoder情報をまとめて保存します。
+
+この段階ではMIL bag生成、attention、slide-level分類、train/validation/test分割、CLAM trainingは実装していません。feature抽出前に「Validate CLAM export」でstaging CSVの整合性を確認し、slide labelと患者単位のデータ分割は研究者が別途確認してください。
+
 ### 日時・annotation履歴
 
 研究データの作成・確認・export時刻は、Asia/TokyoのISO 8601形式で自動保存します。
@@ -557,6 +601,9 @@ WSI patch workflowでは、YOLO学習画像は親NDPI/WSIではなく `data/patc
 .
 ├── app.py
 ├── requirements.txt
+├── requirements-ml.txt
+├── scripts
+│   └── extract_deep_features.py
 ├── README.md
 └── data
     ├── images
