@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -317,6 +318,21 @@ PATCH_QUEUE_STATUSES = [
     "skipped",
     "flagged",
 ]
+PATCH_FEATURE_VERSION = "rgb_hsv_v1"
+PATCH_FEATURE_FIELDS = [
+    "brightness_mean",
+    "saturation_mean",
+    "hematoxylin_score",
+    "eosin_score",
+    "nuclei_density_proxy",
+    "red_orange_score",
+]
+PATCH_QUEUE_SORT_OPTIONS = {
+    "priority_score": "優先度が高い順",
+    "cluster_id": "クラスタ順",
+    "spatial": "WSI上の位置順",
+    "tissue_ratio": "組織率が高い順",
+}
 PATCH_MANIFEST_FIELDS = [
     "source_wsi_name",
     "patch_id",
@@ -330,6 +346,10 @@ PATCH_MANIFEST_FIELDS = [
     "target_mpp",
     "objective_magnification",
     "tissue_ratio",
+    *PATCH_FEATURE_FIELDS,
+    "cluster_id",
+    "priority_score",
+    "feature_version",
     "status",
     "annotation_count",
     "eosinophil_count",
@@ -582,6 +602,7 @@ def init_session_state() -> None:
         "active_patch_source": None,
         "active_patch_queue_id": None,
         "patch_queue_index": 0,
+        "patch_queue_sort_by": "priority_score",
         "project_template": "ECRS_nasal_polyp",
         "image_metadata": default_image_metadata("ECRS_nasal_polyp"),
         "region_annotations": default_region_annotations(),
@@ -1178,6 +1199,147 @@ def calculate_tissue_ratio(image: Image.Image, sample_size: int = 256) -> float:
     return tissue_pixels / len(pixels)
 
 
+def calculate_patch_features(image: Image.Image, sample_size: int = 256) -> dict[str, float]:
+    """Calculate lightweight CLAM-inspired RGB/HSV patch descriptors."""
+    sample = image.convert("RGB")
+    sample.thumbnail((sample_size, sample_size), Image.Resampling.BILINEAR)
+    rgb = np.asarray(sample, dtype=np.float32) / 255.0
+    if rgb.size == 0:
+        return {field: 0.0 for field in PATCH_FEATURE_FIELDS}
+
+    hsv = np.asarray(sample.convert("HSV"), dtype=np.float32) / 255.0
+    red = rgb[..., 0]
+    green = rgb[..., 1]
+    blue = rgb[..., 2]
+    saturation = hsv[..., 1]
+    brightness = hsv[..., 2]
+    darkness = 1.0 - brightness
+    tissue_mask = ((brightness < 0.86) | ((brightness < 0.96) & (saturation > 0.04))).astype(np.float32)
+
+    purple_blue = np.clip(blue - green * 0.45 - red * 0.15, 0.0, 1.0)
+    hematoxylin = (
+        purple_blue
+        * (0.35 + 0.65 * darkness)
+        * (0.4 + 0.6 * saturation)
+        * tissue_mask
+    )
+
+    pink_balance = np.clip(red - green * 0.55, 0.0, 1.0)
+    eosin = (
+        pink_balance
+        * np.clip(blue - green * 0.15, 0.0, 1.0)
+        * (0.3 + 0.7 * saturation)
+        * tissue_mask
+    )
+
+    nuclei_mask = (
+        (brightness < 0.72)
+        & (blue > green * 0.85)
+        & (red > green * 0.75)
+        & (saturation > 0.12)
+    )
+
+    red_dominance = np.clip(red - np.maximum(green, blue) * 0.75, 0.0, 1.0)
+    orange_balance = np.clip(red - blue * 0.55, 0.0, 1.0) * np.clip(green - blue * 0.25, 0.0, 1.0)
+    red_orange = (
+        np.maximum(red_dominance, orange_balance)
+        * (0.25 + 0.75 * saturation)
+        * tissue_mask
+    )
+
+    return {
+        "brightness_mean": float(np.mean(brightness)),
+        "saturation_mean": float(np.mean(saturation)),
+        "hematoxylin_score": float(np.mean(hematoxylin)),
+        "eosin_score": float(np.mean(eosin)),
+        "nuclei_density_proxy": float(np.mean(nuclei_mask)),
+        "red_orange_score": float(np.mean(red_orange)),
+    }
+
+
+def calculate_patch_priority(tissue_ratio: float, features: dict[str, float]) -> float:
+    """Combine tissue, nuclei, eosin and red-orange signals into a temporary score."""
+    score = (
+        0.30 * min(max(tissue_ratio, 0.0), 1.0)
+        + 0.30 * min(max(features.get("nuclei_density_proxy", 0.0) * 4.0, 0.0), 1.0)
+        + 0.25 * min(max(features.get("eosin_score", 0.0) * 8.0, 0.0), 1.0)
+        + 0.15 * min(max(features.get("red_orange_score", 0.0) * 6.0, 0.0), 1.0)
+    )
+    return min(max(score, 0.0), 1.0)
+
+
+def cluster_patch_manifest(source_wsi_name: str, cluster_count: int) -> int:
+    """Cluster feature-complete patches for one WSI and persist cluster_id."""
+    from sklearn.cluster import MiniBatchKMeans
+    from sklearn.preprocessing import StandardScaler
+
+    manifest = load_patch_manifest()
+    if manifest.empty:
+        return 0
+    source_mask = manifest["source_wsi_name"] == source_wsi_name
+    source_rows = manifest.loc[source_mask].copy()
+    if source_rows.empty:
+        return 0
+
+    feature_frame = source_rows[PATCH_FEATURE_FIELDS].apply(pd.to_numeric, errors="coerce")
+    valid_mask = feature_frame.notna().all(axis=1)
+    valid_features = feature_frame.loc[valid_mask]
+    if valid_features.empty:
+        return 0
+
+    resolved_cluster_count = max(1, min(int(cluster_count), len(valid_features)))
+    scaled_features = StandardScaler().fit_transform(valid_features)
+    resolved_cluster_count = min(resolved_cluster_count, len(np.unique(scaled_features, axis=0)))
+    if resolved_cluster_count == 1:
+        labels = np.zeros(len(valid_features), dtype=int)
+    else:
+        labels = MiniBatchKMeans(
+            n_clusters=resolved_cluster_count,
+            random_state=42,
+            batch_size=2048,
+            n_init=10,
+        ).fit_predict(scaled_features)
+
+    manifest.loc[valid_features.index, "cluster_id"] = labels.astype(str)
+    manifest.loc[source_mask, "updated_at"] = datetime.now().isoformat(timespec="seconds")
+    save_patch_manifest(manifest)
+    return resolved_cluster_count
+
+
+def recalculate_patch_features(source_wsi_name: str, cluster_count: int) -> dict[str, int]:
+    """Backfill features and priority for existing saved patches."""
+    manifest = load_patch_manifest()
+    if manifest.empty:
+        return {"updated": 0, "clusters": 0, "missing": 0}
+
+    source_mask = manifest["source_wsi_name"] == source_wsi_name
+    updated = 0
+    missing = 0
+    for index, row in manifest.loc[source_mask].iterrows():
+        image_path = Path(str(row.get("image_path", "")))
+        if not image_path.exists():
+            image_path = patch_image_path(source_wsi_name, str(row["patch_id"]))
+        if not image_path.exists():
+            missing += 1
+            continue
+        with Image.open(image_path) as image:
+            rgb_image = image.convert("RGB")
+            tissue_ratio = calculate_tissue_ratio(rgb_image)
+            features = calculate_patch_features(rgb_image)
+        priority_score = calculate_patch_priority(tissue_ratio, features)
+        manifest.loc[index, "tissue_ratio"] = f"{tissue_ratio:.6f}"
+        for field, value in features.items():
+            manifest.loc[index, field] = f"{value:.6f}"
+        manifest.loc[index, "priority_score"] = f"{priority_score:.6f}"
+        manifest.loc[index, "feature_version"] = PATCH_FEATURE_VERSION
+        manifest.loc[index, "updated_at"] = datetime.now().isoformat(timespec="seconds")
+        updated += 1
+
+    save_patch_manifest(manifest)
+    clusters = cluster_patch_manifest(source_wsi_name, cluster_count) if updated else 0
+    return {"updated": updated, "clusters": clusters, "missing": missing}
+
+
 def load_patch_manifest() -> pd.DataFrame:
     if not PATCH_MANIFEST_PATH.exists():
         return pd.DataFrame(columns=PATCH_MANIFEST_FIELDS)
@@ -1204,7 +1366,7 @@ def save_patch_manifest(manifest: pd.DataFrame) -> None:
     )
 
 
-def patch_queue_rows(source_wsi_name: str) -> pd.DataFrame:
+def patch_queue_rows(source_wsi_name: str, sort_by: str = "spatial") -> pd.DataFrame:
     manifest = load_patch_manifest()
     if manifest.empty:
         return manifest
@@ -1213,7 +1375,24 @@ def patch_queue_rows(source_wsi_name: str) -> pd.DataFrame:
         return rows
     rows["_patch_y"] = pd.to_numeric(rows["patch_y"], errors="coerce").fillna(0)
     rows["_patch_x"] = pd.to_numeric(rows["patch_x"], errors="coerce").fillna(0)
-    return rows.sort_values(["_patch_y", "_patch_x"]).drop(columns=["_patch_y", "_patch_x"]).reset_index(drop=True)
+    rows["_priority_score"] = pd.to_numeric(rows["priority_score"], errors="coerce").fillna(-1)
+    rows["_cluster_id"] = pd.to_numeric(rows["cluster_id"], errors="coerce").fillna(999999)
+    rows["_tissue_ratio"] = pd.to_numeric(rows["tissue_ratio"], errors="coerce").fillna(-1)
+
+    if sort_by == "priority_score":
+        sort_columns = ["_priority_score", "_cluster_id", "_patch_y", "_patch_x"]
+        ascending = [False, True, True, True]
+    elif sort_by == "cluster_id":
+        sort_columns = ["_cluster_id", "_priority_score", "_patch_y", "_patch_x"]
+        ascending = [True, False, True, True]
+    elif sort_by == "tissue_ratio":
+        sort_columns = ["_tissue_ratio", "_patch_y", "_patch_x"]
+        ascending = [False, True, True]
+    else:
+        sort_columns = ["_patch_y", "_patch_x"]
+        ascending = [True, True]
+    helper_columns = ["_patch_y", "_patch_x", "_priority_score", "_cluster_id", "_tissue_ratio"]
+    return rows.sort_values(sort_columns, ascending=ascending).drop(columns=helper_columns).reset_index(drop=True)
 
 
 def update_patch_manifest_status(
@@ -1269,6 +1448,7 @@ def generate_wsi_patch_queue(
     target_mpp: str,
     objective_magnification: str,
     minimum_tissue_ratio: float,
+    cluster_count: int,
     progress_callback: Any | None = None,
 ) -> dict[str, int]:
     """Create non-overlapping tissue patches and upsert them into the queue manifest."""
@@ -1330,6 +1510,8 @@ def generate_wsi_patch_queue(
                 if progress_callback:
                     progress_callback(index + 1, len(grid))
                 continue
+            features = calculate_patch_features(patch)
+            priority_score = calculate_patch_priority(tissue_ratio, features)
 
             patch_id = f"patch_x{patch_x}_y{patch_y}_level{level}_{patch_size}x{patch_size}"
             output_path = patch_image_path(wsi_name, patch_id)
@@ -1352,6 +1534,10 @@ def generate_wsi_patch_queue(
                     "target_mpp": resolved_target_mpp,
                     "objective_magnification": objective_magnification,
                     "tissue_ratio": f"{tissue_ratio:.6f}",
+                    **{field: f"{value:.6f}" for field, value in features.items()},
+                    "cluster_id": previous.get("cluster_id", ""),
+                    "priority_score": f"{priority_score:.6f}",
+                    "feature_version": PATCH_FEATURE_VERSION,
                     "status": previous.get("status", "not_started"),
                     "annotation_count": previous.get("annotation_count", "0"),
                     "eosinophil_count": previous.get("eosinophil_count", "0"),
@@ -1371,7 +1557,13 @@ def generate_wsi_patch_queue(
         else pd.concat([other_rows, generated_frame], ignore_index=True)
     )
     save_patch_manifest(combined)
-    return {"generated": len(generated_rows), "excluded": excluded, "total_tiles": len(grid)}
+    clusters = cluster_patch_manifest(wsi_name, cluster_count) if generated_rows else 0
+    return {
+        "generated": len(generated_rows),
+        "excluded": excluded,
+        "total_tiles": len(grid),
+        "clusters": clusters,
+    }
 
 
 def prepared_patch_from_manifest_row(
@@ -2655,7 +2847,10 @@ def activate_adjacent_queue_patch(
     current_patch_id: str,
     offset: int,
 ) -> bool:
-    queue_rows = patch_queue_rows(source_wsi_name)
+    queue_rows = patch_queue_rows(
+        source_wsi_name,
+        str(st.session_state.get("patch_queue_sort_by", "priority_score")),
+    )
     matches = queue_rows.index[queue_rows["patch_id"] == current_patch_id].tolist()
     if not matches:
         return False
@@ -2690,7 +2885,8 @@ def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
         return None
 
     source_key = f"{uploaded_image.name}:{uploaded_image.size}"
-    queue_rows = patch_queue_rows(uploaded_image.name)
+    queue_sort_by = str(st.session_state.get("patch_queue_sort_by", "priority_score"))
+    queue_rows = patch_queue_rows(uploaded_image.name, queue_sort_by)
     active_patch = st.session_state.active_patch
     if active_patch and st.session_state.active_patch_source == source_key:
         active_patch_id = active_patch.get("patch_metadata", {}).get("patch_id", "")
@@ -2705,7 +2901,8 @@ def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
                 text=f"patch queue: {current_index + 1}/{len(queue_rows)} | 完了 {completed}/{len(queue_rows)}",
             )
             st.caption(
-                f"status: {current_row['status']} | tissue_ratio: {current_row['tissue_ratio']} | "
+                f"status: {current_row['status']} | priority: {current_row['priority_score']} | "
+                f"cluster: {current_row['cluster_id']} | tissue_ratio: {current_row['tissue_ratio']} | "
                 f"patch_id: {active_patch_id}"
             )
             navigation = st.columns([1, 1, 2])
@@ -2798,6 +2995,35 @@ def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
             value=0.10,
             step=0.01,
         )
+        queue_options = st.columns(3)
+        cluster_count = int(
+            queue_options[0].number_input(
+                "cluster数",
+                min_value=2,
+                max_value=20,
+                value=6,
+                step=1,
+            )
+        )
+        queue_sort_by = queue_options[1].selectbox(
+            "queueの並び順",
+            list(PATCH_QUEUE_SORT_OPTIONS),
+            format_func=lambda value: PATCH_QUEUE_SORT_OPTIONS[value],
+            key="patch_queue_sort_by",
+        )
+        queue_rows = patch_queue_rows(uploaded_image.name, queue_sort_by)
+        if queue_options[2].button(
+            "特徴量・クラスタを再計算",
+            disabled=queue_rows.empty,
+            use_container_width=True,
+        ):
+            with st.spinner("保存済みpatchの特徴量とクラスタを計算しています..."):
+                feature_result = recalculate_patch_features(uploaded_image.name, cluster_count)
+            st.success(
+                f"再計算しました: patch {feature_result['updated']}件 / "
+                f"cluster {feature_result['clusters']} / 欠損画像 {feature_result['missing']}件"
+            )
+            st.rerun()
         queue_level_width, queue_level_height = level_dimensions[queue_level]
         estimated_tiles = (
             max(0, queue_level_width // int(queue_patch_size))
@@ -2830,11 +3056,13 @@ def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
                     st.session_state.image_metadata.get("objective_magnification", "unknown")
                 ),
                 minimum_tissue_ratio=float(minimum_tissue_ratio),
+                cluster_count=cluster_count,
                 progress_callback=update_progress,
             )
             st.success(
                 f"patch queueを生成しました: 採用 {result['generated']} / "
-                f"除外 {result['excluded']} / 全tile {result['total_tiles']}"
+                f"除外 {result['excluded']} / 全tile {result['total_tiles']} / "
+                f"cluster {result['clusters']}"
             )
             st.rerun()
 
@@ -2864,6 +3092,10 @@ def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
                     [
                         "patch_id",
                         "tissue_ratio",
+                        "priority_score",
+                        "cluster_id",
+                        "nuclei_density_proxy",
+                        "eosin_score",
                         "status",
                         "annotation_count",
                         "eosinophil_count",
@@ -3249,7 +3481,10 @@ def main() -> None:
     )
     if not queue_manifest.empty and queue_mask.any():
         current_queue_status = str(queue_manifest.loc[queue_mask, "status"].iloc[0])
-        source_queue = patch_queue_rows(current_wsi_name)
+        source_queue = patch_queue_rows(
+            current_wsi_name,
+            str(st.session_state.get("patch_queue_sort_by", "priority_score")),
+        )
         queue_matches = source_queue.index[source_queue["patch_id"] == current_patch_id].tolist()
         current_queue_index = int(queue_matches[0]) if queue_matches else 0
         completed = int(source_queue["status"].isin(["done", "reviewed_empty"]).sum())

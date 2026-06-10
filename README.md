@@ -159,6 +159,35 @@ WSI由来patchのアノテーション画面では、マウスホイールで表
 
 学習dataset生成時に「patch queueは done / reviewed_empty のみ」を有効にすると、queue管理されたpatchのうち、人間による確認が完了したpatchだけを出力します。`reviewed_empty`は「画像内の対象クラスである好酸球が0件」と人間が確認した陰性patchです。`ignore`は対象細胞ではなく、学習・評価から除外する領域または判定不能物として扱います。手動作成した従来patchはqueue statusがないため、既存の`reviewed / exported`条件で扱われます。
 
+### CLAM-inspired patch prioritization
+
+この機能はCLAM本体や深層学習によるWSI表現学習ではありません。CLAM導入前段階として、保存済みpatchから軽量なRGB/HSV特徴量を計算し、類似patchのクラスタリングと確認順の優先付けを行う機能です。torchや事前学習済みモデルは使用しません。
+
+`patch_manifest.csv`には次の列が追加されます。古いmanifestを読み込んだ場合、不足列は空欄で自動補完されるため、既存queueとの後方互換性があります。
+
+- `brightness_mean`: HSVの明度平均
+- `saturation_mean`: HSVの彩度平均
+- `hematoxylin_score`: 青紫色・暗色成分を用いたhematoxylin様スコア
+- `eosin_score`: ピンク色成分を用いたeosin様スコア
+- `nuclei_density_proxy`: 暗い青紫色pixelの割合による核密度proxy
+- `red_orange_score`: 赤色・橙色成分の暫定スコア
+- `cluster_id`: MiniBatchKMeansによるWSI内クラスタID
+- `priority_score`: 組織率、核密度proxy、eosin、赤橙色スコアの重み付き暫定値
+- `feature_version`: 特徴計算方式のバージョン。初期値は`rgb_hsv_v1`
+
+自動patch queue画面ではcluster数を選択できます。新しいqueue生成時に特徴量とclusterを計算し、既存queueには「特徴量・クラスタを再計算」を使用できます。
+
+queueの並び順:
+
+- `優先度が高い順`: `priority_score`の降順
+- `クラスタ順`: `cluster_id`ごとにまとめ、cluster内はpriority順
+- `WSI上の位置順`: `patch_y`, `patch_x`順
+- `組織率が高い順`: `tissue_ratio`の降順
+
+`priority_score`は好酸球の確率ではなく、確認候補を並べるための暫定ヒューリスティックです。染色条件や臓器によって色特徴が変わるため、人間による確認を省略する目的では使用しません。
+
+将来的には、各patchの埋め込みベクトルをHDF5やNumPy形式で保存し、CLAM-compatible feature export、attention scoreのimport、cluster/attentionに基づくsamplingへ拡張する予定です。
+
 ## Multi-Tissue Eosinophil Reference Dataset
 
 副鼻腔炎画像が届くまで、肝臓など他臓器H&E画像を含む汎用好酸球reference datasetを作成できます。`project_template` と `source_organ` で、ECRS本命データと汎用referenceデータを分けて管理してください。
