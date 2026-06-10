@@ -15,6 +15,8 @@ data/dataset/*
 data/patches/*
 data/patches/images/*
 data/clam/*
+data/clam/coords/*.csv
+data/clam/features/*.csv
 !data/images/.gitkeep
 !data/annotations/.gitkeep
 !data/exports/.gitkeep

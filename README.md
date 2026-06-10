@@ -217,6 +217,26 @@ slide-level `label`には、保存済み画像メタデータの`disease_context
 
 NDPI全体を巨大TIFFへ変換する必要はありません。元WSIとlevel 0座標を保持したまま、必要なpatchだけをOpenSlideから読み出す設計です。
 
+#### CLAM exportの検証
+
+1. 「CLAM-compatibleデータを生成」を押します。
+2. 続けて「Validate CLAM export」を押します。
+3. slide数、patch数、確認したCSVファイル数、status別件数を確認します。
+4. slide別表の`patch_ids_match`がすべて`True`であることを確認します。
+5. errorまたはwarningが表示された場合は、CLAM feature extractionへ進む前に内容を確認します。
+
+バリデーションでは次を確認します。
+
+- `patch_manifest.csv`, `slide_labels.csv`, `process_list_autogen.csv`の存在と必須列
+- `coords/*.csv`, `features/*.csv`の存在と読み込み可否
+- slideごとの`patch_id`がpatch manifest、coords、featuresで一致すること
+- slide label、process list、patch manifestの`slide_id`集合が一致すること
+- slide内で`patch_id`が重複していないこと
+- `patch_count`がmanifestの実件数と一致すること
+- patch数0のslideやCLAM export全体が空でないこと
+
+`CLAM-compatible CSV stagingの整合性を確認しました`と表示されても、slide-level labelの医学的妥当性やtrain/validation分割のリークまでは検証しません。これらはMIL/CLAM学習前に別途確認してください。
+
 ## Multi-Tissue Eosinophil Reference Dataset
 
 副鼻腔炎画像が届くまで、肝臓など他臓器H&E画像を含む汎用好酸球reference datasetを作成できます。`project_template` と `source_organ` で、ECRS本命データと汎用referenceデータを分けて管理してください。

@@ -2437,6 +2437,181 @@ def generate_clam_compatible_export(
     }
 
 
+def read_validation_csv(path: Path) -> tuple[pd.DataFrame | None, str | None]:
+    if not path.exists():
+        return None, f"ファイルがありません: {path}"
+    try:
+        return pd.read_csv(path, dtype=str, keep_default_na=False), None
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame(), f"CSVが空です: {path}"
+    except (OSError, pd.errors.ParserError) as error:
+        return None, f"CSVを読み込めません: {path} ({error})"
+
+
+def validate_clam_export() -> dict[str, Any]:
+    """Validate CLAM-compatible CSV staging files and patch_id relationships."""
+    required_paths = {
+        "patch_manifest": CLAM_DIR / "patch_manifest.csv",
+        "slide_labels": CLAM_DIR / "slide_labels.csv",
+        "process_list": CLAM_DIR / "process_list_autogen.csv",
+    }
+    errors: list[str] = []
+    warnings: list[str] = []
+    files_checked = 0
+    for directory, label in (
+        (CLAM_COORD_DIR, "coords"),
+        (CLAM_FEATURE_DIR, "features"),
+    ):
+        if not directory.exists():
+            errors.append(f"{label}ディレクトリがありません: {directory}")
+        elif not list(directory.glob("*.csv")):
+            warnings.append(f"{label}ディレクトリにCSVがありません: {directory}")
+
+    loaded: dict[str, pd.DataFrame] = {}
+    for name, path in required_paths.items():
+        frame, error = read_validation_csv(path)
+        if error:
+            errors.append(error)
+        if frame is not None:
+            loaded[name] = frame
+            files_checked += 1
+
+    manifest = loaded.get("patch_manifest", pd.DataFrame())
+    slide_labels = loaded.get("slide_labels", pd.DataFrame())
+    process_list = loaded.get("process_list", pd.DataFrame())
+
+    manifest_required = {"patch_id", "slide_id", "source_wsi_name", "status"}
+    labels_required = {"slide_id", "patch_count"}
+    process_required = {"slide_id", "patch_count", "coords_csv", "features_csv"}
+    for name, frame, required_columns in (
+        ("patch_manifest.csv", manifest, manifest_required),
+        ("slide_labels.csv", slide_labels, labels_required),
+        ("process_list_autogen.csv", process_list, process_required),
+    ):
+        missing_columns = sorted(required_columns - set(frame.columns))
+        if missing_columns:
+            errors.append(f"{name}に必須列がありません: {', '.join(missing_columns)}")
+
+    patch_count = len(manifest)
+    slide_ids = set(manifest["slide_id"]) if "slide_id" in manifest.columns else set()
+    label_slide_ids = set(slide_labels["slide_id"]) if "slide_id" in slide_labels.columns else set()
+    process_slide_ids = set(process_list["slide_id"]) if "slide_id" in process_list.columns else set()
+    all_slide_ids = slide_ids | label_slide_ids | process_slide_ids
+    status_counts = (
+        manifest["status"].value_counts().to_dict()
+        if "status" in manifest.columns
+        else {}
+    )
+
+    if patch_count == 0:
+        warnings.append("patch_manifest.csvのpatch数が0です。")
+    if not all_slide_ids:
+        warnings.append("CLAM exportにslideがありません。")
+    if slide_ids != label_slide_ids:
+        errors.append(
+            "patch_manifest.csvとslide_labels.csvのslide_id集合が一致しません。"
+        )
+    if slide_ids != process_slide_ids:
+        errors.append(
+            "patch_manifest.csvとprocess_list_autogen.csvのslide_id集合が一致しません。"
+        )
+
+    duplicate_patch_ids = []
+    if {"slide_id", "patch_id"}.issubset(manifest.columns):
+        duplicate_mask = manifest.duplicated(["slide_id", "patch_id"], keep=False)
+        duplicate_patch_ids = manifest.loc[duplicate_mask, ["slide_id", "patch_id"]].to_dict("records")
+        if duplicate_patch_ids:
+            errors.append(f"slide内で重複するpatch_idがあります: {len(duplicate_patch_ids)}件")
+
+    slide_results: list[dict[str, Any]] = []
+    for slide_id in sorted(all_slide_ids):
+        manifest_rows = (
+            manifest.loc[manifest["slide_id"] == slide_id]
+            if "slide_id" in manifest.columns
+            else pd.DataFrame()
+        )
+        expected_ids = set(manifest_rows["patch_id"]) if "patch_id" in manifest_rows.columns else set()
+
+        process_rows = (
+            process_list.loc[process_list["slide_id"] == slide_id]
+            if "slide_id" in process_list.columns
+            else pd.DataFrame()
+        )
+        if process_rows.empty:
+            warnings.append(f"{slide_id}: process_listに行がありません。")
+            coords_path = CLAM_COORD_DIR / f"{safe_file_stem(slide_id)}.csv"
+            features_path = CLAM_FEATURE_DIR / f"{safe_file_stem(slide_id)}.csv"
+        else:
+            coords_path = Path(str(process_rows.iloc[0].get("coords_csv", "")))
+            features_path = Path(str(process_rows.iloc[0].get("features_csv", "")))
+
+        coords, coords_error = read_validation_csv(coords_path)
+        features, features_error = read_validation_csv(features_path)
+        for error in (coords_error, features_error):
+            if error:
+                errors.append(error)
+        files_checked += int(coords is not None) + int(features is not None)
+
+        coords_ids = set(coords["patch_id"]) if coords is not None and "patch_id" in coords.columns else set()
+        feature_ids = (
+            set(features["patch_id"])
+            if features is not None and "patch_id" in features.columns
+            else set()
+        )
+        if coords is not None and "patch_id" not in coords.columns:
+            errors.append(f"{coords_path}: patch_id列がありません。")
+        if features is not None and "patch_id" not in features.columns:
+            errors.append(f"{features_path}: patch_id列がありません。")
+
+        if expected_ids != coords_ids:
+            errors.append(
+                f"{slide_id}: coordsのpatch_idがmanifestと一致しません "
+                f"(manifest={len(expected_ids)}, coords={len(coords_ids)})。"
+            )
+        if expected_ids != feature_ids:
+            errors.append(
+                f"{slide_id}: featuresのpatch_idがmanifestと一致しません "
+                f"(manifest={len(expected_ids)}, features={len(feature_ids)})。"
+            )
+
+        label_rows = (
+            slide_labels.loc[slide_labels["slide_id"] == slide_id]
+            if "slide_id" in slide_labels.columns
+            else pd.DataFrame()
+        )
+        declared_counts = []
+        for frame in (label_rows, process_rows):
+            if not frame.empty and "patch_count" in frame.columns:
+                declared_counts.append(int(safe_float(frame.iloc[0]["patch_count"], -1) or -1))
+        if any(count != len(expected_ids) for count in declared_counts):
+            warnings.append(
+                f"{slide_id}: CSVに記録されたpatch_countとmanifest件数が一致しません。"
+            )
+        if len(expected_ids) == 0:
+            warnings.append(f"{slide_id}: patch数が0です。")
+
+        slide_results.append(
+            {
+                "slide_id": slide_id,
+                "manifest_patches": len(expected_ids),
+                "coords_patches": len(coords_ids),
+                "features_patches": len(feature_ids),
+                "patch_ids_match": expected_ids == coords_ids == feature_ids,
+            }
+        )
+
+    return {
+        "valid": not errors,
+        "patch_count": patch_count,
+        "slide_count": len(all_slide_ids),
+        "status_counts": status_counts,
+        "files_checked": files_checked,
+        "errors": errors,
+        "warnings": warnings,
+        "slides": slide_results,
+    }
+
+
 def safe_file_stem(value: str) -> str:
     safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("._")
     return safe_stem or "unknown"
@@ -3880,6 +4055,42 @@ def main() -> None:
         )
         if clam_result["skipped"]:
             st.caption(f"未完了のため除外したpatch: {clam_result['skipped']}件")
+
+    if st.button("Validate CLAM export", use_container_width=True):
+        validation = validate_clam_export()
+        if validation["valid"]:
+            st.success("CLAM-compatible CSV stagingの整合性を確認しました。")
+        else:
+            st.error("CLAM-compatible CSV stagingに不整合があります。")
+
+        validation_metrics = st.columns(3)
+        validation_metrics[0].metric("slide数", validation["slide_count"])
+        validation_metrics[1].metric("patch数", validation["patch_count"])
+        validation_metrics[2].metric("確認ファイル数", validation["files_checked"])
+
+        if validation["status_counts"]:
+            st.caption("status別patch数")
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {"status": status, "patch_count": count}
+                        for status, count in validation["status_counts"].items()
+                    ]
+                ),
+                hide_index=True,
+                use_container_width=True,
+            )
+        if validation["slides"]:
+            st.caption("slide別patch_id整合性")
+            st.dataframe(
+                pd.DataFrame(validation["slides"]),
+                hide_index=True,
+                use_container_width=True,
+            )
+        for error in validation["errors"]:
+            st.error(error)
+        for warning in validation["warnings"]:
+            st.warning(warning)
 
     download_payload = {
         "schema_version": "2.3",
