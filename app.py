@@ -318,6 +318,9 @@ DATASET_LABEL_DIR = DATASET_DIR / "labels"
 CLAM_DIR = DATA_DIR / "clam"
 CLAM_COORD_DIR = CLAM_DIR / "coords"
 CLAM_FEATURE_DIR = CLAM_DIR / "features"
+CLAM_DEEP_FEATURE_CSV_DIR = CLAM_DIR / "deep_features_csv"
+CLAM_DEEP_FEATURE_PT_DIR = CLAM_DIR / "deep_features"
+CLAM_MIL_BAGS_PATH = CLAM_DIR / "mil_bags.csv"
 MAX_DISPLAY_WIDTH = 1100
 MAX_DISPLAY_HEIGHT = 900
 NDPI_EXTENSIONS = {".ndpi"}
@@ -2774,6 +2777,151 @@ def validate_clam_export() -> dict[str, Any]:
     }
 
 
+def resolve_project_data_path(value: Any) -> Path | None:
+    """Resolve stored project-relative paths without requiring the file to exist."""
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    candidate = Path(raw.replace("\\", "/")).expanduser()
+    if candidate.is_absolute():
+        return candidate
+    return Path.cwd() / candidate
+
+
+def deep_feature_mil_bag_status() -> dict[str, Any]:
+    """Inspect existing deep feature and MIL bag artifacts without loading torch."""
+    result: dict[str, Any] = {
+        "exists": CLAM_MIL_BAGS_PATH.exists(),
+        "bag_count": 0,
+        "bags": [],
+        "warnings": [],
+        "errors": [],
+    }
+    if not result["exists"]:
+        result["warnings"].append(
+            "mil_bags.csvがありません。build_mil_bag_index.pyを実行してください。"
+        )
+        return result
+
+    try:
+        bags = pd.read_csv(
+            CLAM_MIL_BAGS_PATH,
+            dtype=str,
+            keep_default_na=False,
+            encoding="utf-8-sig",
+        )
+    except (OSError, pd.errors.ParserError, pd.errors.EmptyDataError) as error:
+        result["errors"].append(f"mil_bags.csvを読み込めません: {error}")
+        return result
+
+    required_columns = {
+        "slide_id",
+        "label",
+        "source_wsi_name",
+        "feature_csv",
+        "feature_pt",
+        "patch_count",
+        "feature_model",
+        "feature_version",
+    }
+    missing_columns = sorted(required_columns - set(bags.columns))
+    if missing_columns:
+        result["errors"].append(
+            "mil_bags.csvに必要な列がありません: " + ", ".join(missing_columns)
+        )
+        return result
+
+    result["bag_count"] = len(bags)
+    seen_random = False
+    metadata_warning_slides: list[str] = []
+    for _, row in bags.iterrows():
+        slide_id = str(row.get("slide_id", "")).strip()
+        label = str(row.get("label", "")).strip()
+        source_wsi_name = str(row.get("source_wsi_name", "")).strip()
+        feature_version = str(row.get("feature_version", "")).strip()
+        feature_csv_path = resolve_project_data_path(row.get("feature_csv", ""))
+        feature_pt_path = resolve_project_data_path(row.get("feature_pt", ""))
+        feature_csv_exists = bool(feature_csv_path and feature_csv_path.is_file())
+        feature_pt_exists = bool(feature_pt_path and feature_pt_path.is_file())
+        declared_patch_count_value = safe_float(row.get("patch_count", ""), -1)
+        declared_patch_count = int(
+            -1 if declared_patch_count_value is None else declared_patch_count_value
+        )
+        feature_csv_rows: int | None = None
+        patch_count_matches = False
+
+        if feature_csv_exists and feature_csv_path:
+            try:
+                feature_csv_rows = len(
+                    pd.read_csv(
+                        feature_csv_path,
+                        usecols=["patch_id"],
+                        encoding="utf-8-sig",
+                    )
+                )
+                patch_count_matches = feature_csv_rows == declared_patch_count
+                if not patch_count_matches:
+                    result["errors"].append(
+                        f"{slide_id}: mil_bags.csvのpatch_count "
+                        f"({declared_patch_count}) とdeep feature CSVの行数 "
+                        f"({feature_csv_rows}) が一致しません。"
+                    )
+            except (OSError, ValueError, pd.errors.ParserError) as error:
+                result["errors"].append(
+                    f"{slide_id}: deep feature CSVを確認できません: {error}"
+                )
+        else:
+            result["errors"].append(
+                f"{slide_id}: feature_csvが見つかりません: "
+                f"{feature_csv_path or '(空欄)'}"
+            )
+
+        if "random" in feature_version.lower():
+            seen_random = True
+        if (
+            label.lower() in {"unknown", "ecrs"}
+            and source_wsi_name.upper().startswith("JPAID")
+        ):
+            metadata_warning_slides.append(slide_id or source_wsi_name)
+
+        result["bags"].append(
+            {
+                "slide_id": slide_id,
+                "label": label,
+                "patch_count": declared_patch_count,
+                "feature_csv_rows": (
+                    feature_csv_rows if feature_csv_rows is not None else ""
+                ),
+                "patch_count_match": patch_count_matches,
+                "feature_model": str(row.get("feature_model", "")).strip(),
+                "feature_version": feature_version,
+                "feature_csv_exists": feature_csv_exists,
+                "feature_pt_exists": feature_pt_exists,
+            }
+        )
+
+    if seen_random:
+        result["warnings"].append(
+            "--no-pretrainedで作成された動作確認用featureです。"
+            "学習・解析には使わないでください。"
+        )
+    if metadata_warning_slides:
+        result["warnings"].append(
+            "JPAID由来の肝臓候補に見えるslideでlabelがunknownまたはECRSです。"
+            "source_organ、disease_context、slide labelを確認してください: "
+            + ", ".join(metadata_warning_slides)
+        )
+    missing_pt_count = sum(
+        1 for bag in result["bags"] if not bag["feature_pt_exists"]
+    )
+    if missing_pt_count:
+        result["warnings"].append(
+            f"feature_ptがないbagが{missing_pt_count}件あります。"
+            "feature CSVがあればbag indexとしては利用できます。"
+        )
+    return result
+
+
 def safe_file_stem(value: str) -> str:
     safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("._")
     return safe_stem or "unknown"
@@ -4333,6 +4481,43 @@ def main() -> None:
         for error in validation["errors"]:
             st.error(error)
         for warning in validation["warnings"]:
+            st.warning(warning)
+
+    with st.expander("Deep feature / MIL bag status", expanded=True):
+        mil_status = deep_feature_mil_bag_status()
+        if not mil_status["exists"]:
+            st.info(
+                "data/clam/mil_bags.csv はまだ作成されていません。"
+                "deep feature抽出・検証後にbuild_mil_bag_index.pyを実行してください。"
+            )
+        else:
+            status_metrics = st.columns(3)
+            status_metrics[0].metric("bag数", mil_status["bag_count"])
+            status_metrics[1].metric(
+                "feature CSV確認済み",
+                sum(
+                    1
+                    for bag in mil_status["bags"]
+                    if bag["feature_csv_exists"]
+                ),
+            )
+            status_metrics[2].metric(
+                "feature PTあり",
+                sum(
+                    1
+                    for bag in mil_status["bags"]
+                    if bag["feature_pt_exists"]
+                ),
+            )
+            if mil_status["bags"]:
+                st.dataframe(
+                    pd.DataFrame(mil_status["bags"]),
+                    hide_index=True,
+                    use_container_width=True,
+                )
+        for error in mil_status["errors"]:
+            st.error(error)
+        for warning in mil_status["warnings"]:
             st.warning(warning)
 
     download_payload = {

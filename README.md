@@ -332,6 +332,21 @@ python scripts/build_mil_bag_index.py
 
 ここで作成するのはMIL/CLAM学習に渡すbag indexまでです。attention計算、slide-level分類、CLAM training、データ分割はまだ実装していません。
 
+#### アプリでのDeep feature / MIL bag確認
+
+StreamlitアプリのCLAM/MILセクションにある「Deep feature / MIL bag status」では、既存成果物の状態だけを確認できます。アプリからfeatureの再計算やMIL trainingは行いません。
+
+表示・確認する項目:
+
+- `data/clam/mil_bags.csv`の有無とbag数
+- slide ID、label、patch数、feature model/version
+- feature CSVと任意の`.pt`ファイルの存在
+- feature CSVの実際の行数と`mil_bags.csv`の`patch_count`の一致
+- `--no-pretrained`で作成された`random` featureの警告
+- JPAID由来の肝臓候補に見えるslideが`unknown`または`ECRS` labelになっている場合のmetadata確認警告
+
+`.pt`が空欄でもfeature CSVがあればbagとして利用できます。ただし、学習コードが`.pt`を前提とする場合はdeep feature抽出を再実行してください。`random` featureはpipelineの動作確認専用であり、学習・解析には使用しません。
+
 ### 日時・annotation履歴
 
 研究データの作成・確認・export時刻は、Asia/TokyoのISO 8601形式で自動保存します。
