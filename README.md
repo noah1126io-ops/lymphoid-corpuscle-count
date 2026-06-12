@@ -419,6 +419,26 @@ python scripts/build_mil_bag_index.py
 
 Annotation JSONとpatch画像の物理削除は、確認チェックとpatch IDの再入力が必要です。物理削除は元に戻せないため、誤label、artifact、test dataなどは原則として`exclude_from_training`によるsoft deletionを使用してください。
 
+#### Annotationの再読込とやり直し
+
+保存済みpatchを再度開くと、アプリは`source_wsi_name + patch_id`を使って最新のannotation JSONを検索します。metadata修正によってexportファイル名が変わった場合でも、旧ファイル名に保存されたannotationを復元できます。
+
+現在表示中のpatchで「保存済みannotationを再読み込み」を押すと、キャンバス上の未保存内容を破棄し、ディスク上の最新JSONからannotationとmetadataを読み直します。手動でアップロードしたannotation JSONはファイル内容のSHA-256で変更を判定するため、ファイル名やサイズが同じ修正版も再読込されます。
+
+学習データ管理の「アノテーションを最初からやり直す」では、patch画像と元WSIを残したままannotationだけを空にし、patch statusを`not_started`へ戻します。実行前のJSONは次へ自動バックアップします。
+
+```text
+data/annotations/backups/
+```
+
+リセット後はannotation countとeosinophil countが0になり、review/export日時も空になります。既存のCLAM export、deep feature、MIL bagは古くなる可能性があるため、必要に応じて再生成してください。
+
+#### Patch切替の高速化
+
+WSI thumbnailと表示用patch画像はアプリ内でキャッシュし、Previous/Next操作では同じ巨大WSIのthumbnailを毎回作り直しません。通常は保存済み`data/patches/images/`のpatch画像を直接読み込みます。元WSIやpatch画像をアプリ外で置き換えた場合は、アプリを再起動してキャッシュを更新してください。
+
+「学習データ管理」はトグルを開いた時だけ保存済みannotation JSONを走査します。通常のannotation中は閉じておくことで、patch切替時に全annotation JSONを読み直す待ち時間を避けられます。
+
 ### 日時・annotation履歴
 
 研究データの作成・確認・export時刻は、Asia/TokyoのISO 8601形式で自動保存します。

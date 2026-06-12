@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import shutil
 import threading
@@ -336,6 +337,7 @@ PATCH_DIR = DATA_DIR / "patches"
 PATCH_IMAGE_DIR = PATCH_DIR / "images"
 PATCH_MANIFEST_PATH = PATCH_DIR / "patch_manifest.csv"
 ANNOTATION_DIR = DATA_DIR / "annotations"
+ANNOTATION_BACKUP_DIR = ANNOTATION_DIR / "backups"
 EXPORT_DIR = DATA_DIR / "exports"
 YOLO_DIR = EXPORT_DIR / "yolo_labels"
 DATASET_DIR = DATA_DIR / "dataset"
@@ -610,6 +612,7 @@ def ensure_directories() -> None:
         CONVERTED_IMAGE_DIR,
         PATCH_IMAGE_DIR,
         ANNOTATION_DIR,
+        ANNOTATION_BACKUP_DIR,
         EXPORT_DIR,
         YOLO_DIR,
         DATASET_IMAGE_DIR,
@@ -691,6 +694,8 @@ def init_session_state() -> None:
         "active_patch": None,
         "active_patch_source": None,
         "active_patch_queue_id": None,
+        "active_wsi_name": "",
+        "active_wsi_thumbnail_info": {},
         "patch_queue_index": 0,
         "patch_queue_sort_by": "priority_score",
         "patch_review_mode": "Standard review",
@@ -717,6 +722,7 @@ def init_session_state() -> None:
         "region_annotations": default_region_annotations(),
         "last_template": "ECRS_nasal_polyp",
         "training_data_stale": False,
+        "force_saved_annotation_reload": False,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -733,6 +739,7 @@ def load_image(uploaded_file: Any) -> Image.Image:
     return image
 
 
+@st.cache_data(show_spinner=False, max_entries=32)
 def load_image_from_path(image_path: Path) -> Image.Image:
     image = Image.open(image_path)
     if getattr(image, "n_frames", 1) > 1:
@@ -882,6 +889,7 @@ def wsi_mpp(slide: Any) -> tuple[str, str]:
     )
 
 
+@st.cache_data(show_spinner=False, max_entries=8)
 def make_wsi_thumbnail(wsi_path: Path) -> tuple[Image.Image, dict[str, Any]]:
     slide = open_wsi_slide(wsi_path)
     try:
@@ -901,6 +909,30 @@ def make_wsi_thumbnail(wsi_path: Path) -> tuple[Image.Image, dict[str, Any]]:
         "thumbnail_height": thumb_height,
         "scale_x": width / thumb_width,
         "scale_y": height / thumb_height,
+        "mpp_x": mpp_x,
+        "mpp_y": mpp_y,
+        "level_dimensions": level_dimensions,
+        "level_downsamples": level_downsamples,
+    }
+
+
+def navigation_wsi_info(wsi_path: Path, source_wsi_name: str) -> dict[str, Any]:
+    cached_name = str(st.session_state.get("active_wsi_name", ""))
+    cached_info = st.session_state.get("active_wsi_thumbnail_info", {})
+    if cached_name == source_wsi_name and cached_info:
+        return dict(cached_info)
+
+    slide = open_wsi_slide(wsi_path)
+    try:
+        width, height = slide.dimensions
+        mpp_x, mpp_y = wsi_mpp(slide)
+        level_dimensions = [tuple(item) for item in slide.level_dimensions]
+        level_downsamples = [float(item) for item in slide.level_downsamples]
+    finally:
+        slide.close()
+    return {
+        "wsi_width": width,
+        "wsi_height": height,
         "mpp_x": mpp_x,
         "mpp_y": mpp_y,
         "level_dimensions": level_dimensions,
@@ -3298,6 +3330,85 @@ def saved_annotation_records() -> list[tuple[Path, dict[str, Any]]]:
     return records
 
 
+def find_saved_annotation_record(
+    *,
+    source_wsi_name: str = "",
+    patch_id: str = "",
+    image_name: str = "",
+) -> tuple[Path, dict[str, Any]] | None:
+    matches: list[tuple[float, Path, dict[str, Any]]] = []
+    for path, payload in saved_annotation_records():
+        metadata = payload.get("image_metadata", {})
+        same_patch = (
+            source_wsi_name
+            and patch_id
+            and str(metadata.get("source_wsi_name", "")) == source_wsi_name
+            and str(metadata.get("patch_id", "")) == patch_id
+        )
+        same_image = image_name and str(payload.get("image_name", "")) == image_name
+        if same_patch or same_image:
+            try:
+                modified = path.stat().st_mtime
+            except OSError:
+                modified = 0.0
+            matches.append((modified, path, payload))
+    if not matches:
+        return None
+    _, path, payload = max(matches, key=lambda item: item[0])
+    return path, payload
+
+
+def reset_saved_patch_annotations(
+    source_wsi_name: str,
+    patch_id: str,
+) -> Path | None:
+    record = find_saved_annotation_record(
+        source_wsi_name=source_wsi_name,
+        patch_id=patch_id,
+    )
+    if record is None:
+        return None
+    path, payload = record
+    ANNOTATION_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    backup = ANNOTATION_BACKUP_DIR / (
+        f"{path.stem}_{datetime.now(TOKYO_TIMEZONE).strftime('%Y%m%dT%H%M%S')}"
+        f"{path.suffix}"
+    )
+    shutil.copy2(path, backup)
+
+    now = tokyo_now_iso()
+    payload["annotations"] = []
+    payload["saved_at"] = now
+    payload["schema_version"] = "2.5"
+    metadata = payload.get("image_metadata", {})
+    metadata["reviewed"] = False
+    metadata["exported"] = False
+    metadata["reviewed_at"] = ""
+    metadata["exported_at"] = ""
+    payload["image_metadata"] = metadata
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    manifest = load_patch_manifest()
+    if not manifest.empty:
+        mask = (
+            manifest["source_wsi_name"].eq(source_wsi_name)
+            & manifest["patch_id"].eq(patch_id)
+        )
+        if mask.any():
+            manifest.loc[mask, "status"] = "not_started"
+            manifest.loc[mask, "annotation_count"] = "0"
+            manifest.loc[mask, "eosinophil_count"] = "0"
+            manifest.loc[mask, "reviewed_at"] = ""
+            manifest.loc[mask, "exported_at"] = ""
+            manifest.loc[mask, "updated_at"] = now
+            save_patch_manifest(manifest)
+    regenerate_dataset_exports()
+    return backup
+
+
 def training_slide_inventory() -> list[dict[str, Any]]:
     slides: dict[str, dict[str, Any]] = {}
     for path, payload in saved_annotation_records():
@@ -4134,7 +4245,7 @@ def activate_adjacent_queue_patch(
     wsi_path = ORIGINAL_WSI_DIR / source_wsi_name
     if not wsi_path.exists():
         return False
-    _, thumbnail_info = make_wsi_thumbnail(wsi_path)
+    thumbnail_info = navigation_wsi_info(wsi_path, source_wsi_name)
     target_row = queue_rows.iloc[target_index].to_dict()
     patch = prepared_patch_from_manifest_row(target_row, wsi_path, thumbnail_info)
     if target_row["status"] == "not_started":
@@ -4154,7 +4265,7 @@ def activate_review_queue_index(source_wsi_name: str, target_index: int) -> bool
     wsi_path = ORIGINAL_WSI_DIR / source_wsi_name
     if not wsi_path.exists():
         return False
-    _, thumbnail_info = make_wsi_thumbnail(wsi_path)
+    thumbnail_info = navigation_wsi_info(wsi_path, source_wsi_name)
     target_row = queue_rows.iloc[target_index].to_dict()
     patch = prepared_patch_from_manifest_row(target_row, wsi_path, thumbnail_info)
     if target_row["status"] == "not_started":
@@ -4367,6 +4478,8 @@ def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
         st.error(f"patch作成用にWSIファイルを開けませんでした: {error}")
         return None
 
+    st.session_state.active_wsi_name = uploaded_image.name
+    st.session_state.active_wsi_thumbnail_info = thumbnail_info
     source_key = f"{uploaded_image.name}:{uploaded_image.size}"
     st.radio(
         "Patch review mode",
@@ -4785,7 +4898,13 @@ def process_upload(
 
     st.session_state.image_name = str(prepared_image["image_name"])
     if uploaded_annotations:
-        restore_key = f"{prepared_image['image_name']}:{uploaded_annotations.name}:{uploaded_annotations.size}"
+        annotation_digest = hashlib.sha256(
+            uploaded_annotations.getvalue()
+        ).hexdigest()
+        restore_key = (
+            f"{prepared_image['image_name']}:{uploaded_annotations.name}:"
+            f"{annotation_digest}"
+        )
         if st.session_state.restored_annotations_key != restore_key:
             restored, restored_metadata, restored_regions = load_annotation_payload(uploaded_annotations)
             st.session_state.annotation_table = restored
@@ -4805,13 +4924,25 @@ def process_upload(
             st.session_state.restored_annotations_key = restore_key
             st.session_state.canvas_key_version += 1
             st.session_state.canvas_initial_drawing_pending = True
-    elif image_changed:
-        saved_path = image_export_paths(
-            str(prepared_image["image_name"]),
-            st.session_state.image_metadata,
-        )["annotations_json"]
-        payload = load_saved_annotation_payload(saved_path)
-        if payload:
+    elif image_changed or st.session_state.get("force_saved_annotation_reload"):
+        patch_metadata = prepared_image.get("patch_metadata", {})
+        record = find_saved_annotation_record(
+            source_wsi_name=str(
+                patch_metadata.get(
+                    "source_wsi_name",
+                    st.session_state.image_metadata.get("source_wsi_name", ""),
+                )
+            ),
+            patch_id=str(
+                patch_metadata.get(
+                    "patch_id",
+                    st.session_state.image_metadata.get("patch_id", ""),
+                )
+            ),
+            image_name=str(prepared_image["image_name"]),
+        )
+        if record:
+            saved_path, payload = record
             restored = [
                 normalize_annotation_status(item)
                 for item in payload.get("annotations", [])
@@ -4828,9 +4959,15 @@ def process_upload(
                 display_image.size[1],
                 st.session_state.scale_factor,
             )["objects"]
-            st.session_state.restored_annotations_key = str(saved_path)
+            st.session_state.restored_annotations_key = (
+                f"{saved_path}:{saved_path.stat().st_mtime_ns}"
+            )
             st.session_state.canvas_key_version += 1
             st.session_state.canvas_initial_drawing_pending = True
+        elif image_changed:
+            st.session_state.annotation_table = []
+            st.session_state.canvas_objects = []
+        st.session_state.force_saved_annotation_reload = False
 
 
 def process_candidate_import(
@@ -4897,7 +5034,14 @@ def update_imported_candidate_status(annotation_status: str, used_for_training: 
 
 
 def render_training_data_manager() -> None:
-    with st.expander("学習データ管理", expanded=False):
+    if not st.toggle(
+        "学習データ管理を開く",
+        value=False,
+        key="show_training_data_manager",
+        help="開いた時だけ保存済みannotation JSONとmanifestを読み込みます。",
+    ):
+        return
+    with st.expander("学習データ管理", expanded=True):
         st.caption(
             "物理削除より、まずexclude_from_trainingによるsoft exclusionを推奨します。"
             "元NDPI/WSIはこの画面から削除しません。"
@@ -5035,6 +5179,12 @@ def render_training_data_manager() -> None:
                     },
                 )
                 st.session_state.training_data_stale = True
+                if selected_slide in {
+                    str(st.session_state.image_metadata.get("source_wsi_name", "")),
+                    str(st.session_state.image_metadata.get("slide_id", "")),
+                    str(st.session_state.image_name or ""),
+                }:
+                    st.session_state.force_saved_annotation_reload = True
                 st.success(f"{updated}件のannotation JSONを更新しました。")
                 st.warning(
                     "metadataが変更されました。CLAM export、deep feature、"
@@ -5135,6 +5285,13 @@ def render_training_data_manager() -> None:
                     },
                 )
                 st.session_state.training_data_stale = True
+                if (
+                    str(st.session_state.image_metadata.get("source_wsi_name", ""))
+                    == str(patch_row["source_wsi_name"])
+                    and str(st.session_state.image_metadata.get("patch_id", ""))
+                    == str(patch_row["patch_id"])
+                ):
+                    st.session_state.force_saved_annotation_reload = True
                 st.success("Patch設定を保存しました。")
                 st.warning(
                     "既存のCLAM/deep feature/mil_bagsは古い可能性があります。"
@@ -5144,6 +5301,49 @@ def render_training_data_manager() -> None:
             st.caption(
                 "選択slideのdeep featureと、必要に応じて再生成可能なCLAM CSVを削除します。"
             )
+            st.markdown("#### アノテーションを最初からやり直す")
+            st.caption(
+                "patch画像と元WSIは残し、保存済みannotationだけを空にします。"
+                "実行前のJSONはdata/annotations/backups/へ退避します。"
+            )
+            restart_confirm = st.checkbox(
+                "このpatchのannotationをリセットする",
+                key="confirm_annotation_restart",
+            )
+            restart_patch_id = st.text_input(
+                "リセット確認のためpatch_idを入力",
+                key="annotation_restart_patch_id",
+            )
+            if st.button(
+                "バックアップしてannotationをリセット",
+                disabled=not (
+                    restart_confirm
+                    and restart_patch_id == str(patch_row["patch_id"])
+                ),
+                use_container_width=True,
+            ):
+                backup = reset_saved_patch_annotations(
+                    str(patch_row["source_wsi_name"]),
+                    str(patch_row["patch_id"]),
+                )
+                if backup:
+                    if (
+                        str(st.session_state.image_metadata.get("source_wsi_name", ""))
+                        == str(patch_row["source_wsi_name"])
+                        and str(st.session_state.image_metadata.get("patch_id", ""))
+                        == str(patch_row["patch_id"])
+                    ):
+                        st.session_state.annotation_table = []
+                        st.session_state.canvas_objects = []
+                        st.session_state.force_saved_annotation_reload = True
+                        st.session_state.canvas_key_version += 1
+                        st.session_state.canvas_initial_drawing_pending = True
+                    st.session_state.training_data_stale = True
+                    st.success(f"annotationをリセットしました。backup: {backup}")
+                    st.rerun()
+                else:
+                    st.warning("対象patchの保存済みannotation JSONがありません。")
+
             delete_global = st.checkbox(
                 "CLAM再生成系CSVとmil_bags.csvも削除する",
                 key="delete_global_clam_artifacts",
@@ -5363,6 +5563,16 @@ def main() -> None:
                 f"status: {current_queue_status}"
             ),
         )
+        reload_col, _ = st.columns([1, 3])
+        if reload_col.button(
+            "保存済みannotationを再読み込み",
+            use_container_width=True,
+            key="reload_saved_patch_annotation",
+        ):
+            st.session_state.force_saved_annotation_reload = True
+            st.session_state.saved_image_key = None
+            st.rerun()
+
         if positive_mode:
             positive_navigation = st.columns(4)
             if positive_navigation[0].button(
