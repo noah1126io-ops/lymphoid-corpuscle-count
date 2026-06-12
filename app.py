@@ -362,6 +362,16 @@ PATCH_QUEUE_STATUSES = [
     "reviewed_empty",
     "skipped",
     "flagged",
+    "suspected_positive",
+]
+REVIEW_MODES = ["Standard review", "Positive exploration"]
+POSITIVE_SORT_OPTIONS = [
+    "priority_score desc",
+    "tissue_ratio desc",
+    "cluster_id then priority_score",
+    "spatial",
+    "random sample",
+    "cluster-balanced",
 ]
 PATCH_FEATURE_VERSION = "rgb_hsv_v1"
 PATCH_FEATURE_FIELDS = [
@@ -683,6 +693,24 @@ def init_session_state() -> None:
         "active_patch_queue_id": None,
         "patch_queue_index": 0,
         "patch_queue_sort_by": "priority_score",
+        "patch_review_mode": "Standard review",
+        "positive_candidate_index": 0,
+        "positive_only_unreviewed": True,
+        "positive_flagged_only": False,
+        "positive_exclude_reviewed_empty": True,
+        "positive_exclude_done": False,
+        "positive_exclude_skipped": True,
+        "positive_exclude_training": True,
+        "positive_min_priority": 0.0,
+        "positive_top_n": 100,
+        "positive_cluster_filter": "all",
+        "positive_status_filter": [],
+        "positive_tissue_region_filter": "all",
+        "positive_disease_context_filter": "all",
+        "positive_source_organ_filter": "all",
+        "positive_sort": "priority_score desc",
+        "positive_per_cluster": 5,
+        "positive_random_seed": 42,
         "annotation_session_id": new_annotation_session_id(),
         "project_template": "ECRS_nasal_polyp",
         "image_metadata": default_image_metadata("ECRS_nasal_polyp"),
@@ -1479,6 +1507,216 @@ def patch_queue_rows(source_wsi_name: str, sort_by: str = "spatial") -> pd.DataF
         ascending = [True, True]
     helper_columns = ["_patch_y", "_patch_x", "_priority_score", "_cluster_id", "_tissue_ratio"]
     return rows.sort_values(sort_columns, ascending=ascending).drop(columns=helper_columns).reset_index(drop=True)
+
+
+def patch_metadata_lookup() -> dict[tuple[str, str], dict[str, Any]]:
+    lookup: dict[tuple[str, str], dict[str, Any]] = {}
+    for payload in saved_annotation_payloads():
+        metadata = payload.get("image_metadata", {})
+        key = (
+            str(metadata.get("source_wsi_name", "")).strip(),
+            str(metadata.get("patch_id", "")).strip(),
+        )
+        if all(key):
+            lookup[key] = metadata
+    return lookup
+
+
+def positive_exploration_rows(
+    source_wsi_name: str,
+    *,
+    only_unreviewed: bool = True,
+    flagged_only: bool = False,
+    exclude_reviewed_empty: bool = True,
+    exclude_done: bool = False,
+    exclude_skipped: bool = True,
+    exclude_from_training: bool = True,
+    minimum_priority_score: float = 0.0,
+    top_n: int = 100,
+    cluster_id: str = "all",
+    statuses: list[str] | None = None,
+    tissue_region: str = "all",
+    disease_context: str = "all",
+    source_organ: str = "all",
+    sort_by: str = "priority_score desc",
+    per_cluster: int = 5,
+    random_seed: int = 42,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Build a filtered, read-only queue for finding likely positive patches."""
+    manifest = load_patch_manifest()
+    warnings: list[str] = []
+    if manifest.empty:
+        return manifest, warnings
+    rows = manifest.loc[
+        manifest["source_wsi_name"].eq(source_wsi_name)
+    ].copy()
+    if rows.empty:
+        return rows, warnings
+
+    metadata_by_patch = patch_metadata_lookup()
+    slide_metadata = slide_metadata_by_wsi().get(source_wsi_name, {})
+    for field in ("tissue_region", "disease_context", "source_organ"):
+        rows[field] = [
+            metadata_by_patch.get((source_wsi_name, str(patch_id)), {}).get(
+                field,
+                slide_metadata.get(field, ""),
+            )
+            for patch_id in rows["patch_id"]
+        ]
+
+    rows["_priority"] = pd.to_numeric(
+        rows.get("priority_score", pd.Series(index=rows.index, dtype=str)),
+        errors="coerce",
+    )
+    rows["_tissue"] = pd.to_numeric(
+        rows.get("tissue_ratio", pd.Series(index=rows.index, dtype=str)),
+        errors="coerce",
+    ).fillna(-1)
+    rows["_cluster_text"] = rows.get(
+        "cluster_id", pd.Series("", index=rows.index)
+    ).fillna("").astype(str).str.strip()
+    rows["_cluster_number"] = pd.to_numeric(
+        rows["_cluster_text"], errors="coerce"
+    ).fillna(999999)
+    rows["_patch_x"] = pd.to_numeric(rows["patch_x"], errors="coerce").fillna(0)
+    rows["_patch_y"] = pd.to_numeric(rows["patch_y"], errors="coerce").fillna(0)
+
+    if exclude_from_training and "exclude_from_training" in rows.columns:
+        rows = rows.loc[~rows["exclude_from_training"].map(safe_bool)]
+    if only_unreviewed:
+        rows = rows.loc[
+            rows["status"].isin(
+                ["not_started", "in_progress", "flagged", "suspected_positive"]
+            )
+        ]
+    if flagged_only:
+        rows = rows.loc[
+            rows["status"].isin(["flagged", "suspected_positive"])
+        ]
+    if exclude_reviewed_empty:
+        rows = rows.loc[~rows["status"].eq("reviewed_empty")]
+    if exclude_done:
+        rows = rows.loc[~rows["status"].eq("done")]
+    if exclude_skipped:
+        rows = rows.loc[~rows["status"].eq("skipped")]
+    if statuses:
+        rows = rows.loc[rows["status"].isin(statuses)]
+    if minimum_priority_score > 0:
+        rows = rows.loc[rows["_priority"].fillna(-1).ge(minimum_priority_score)]
+    if cluster_id != "all":
+        rows = rows.loc[rows["_cluster_text"].eq(str(cluster_id))]
+    for field, value in (
+        ("tissue_region", tissue_region),
+        ("disease_context", disease_context),
+        ("source_organ", source_organ),
+    ):
+        if value != "all" and field in rows.columns:
+            rows = rows.loc[rows[field].fillna("").astype(str).eq(value)]
+
+    if sort_by == "tissue_ratio desc":
+        rows = rows.sort_values(
+            ["_tissue", "_priority"], ascending=[False, False], kind="stable"
+        )
+    elif sort_by == "cluster_id then priority_score":
+        rows = rows.sort_values(
+            ["_cluster_number", "_priority"],
+            ascending=[True, False],
+            kind="stable",
+        )
+    elif sort_by == "spatial":
+        rows = rows.sort_values(
+            ["_patch_y", "_patch_x"], ascending=[True, True], kind="stable"
+        )
+    elif sort_by == "random sample":
+        rows = rows.sample(frac=1, random_state=random_seed)
+    elif sort_by == "cluster-balanced":
+        clustered = rows.loc[rows["_cluster_text"].ne("")].copy()
+        if clustered.empty:
+            warnings.append(
+                "cluster_idがないためpriority_score順へfallbackしました。"
+            )
+            rows = rows.sort_values(
+                ["_priority", "_tissue"],
+                ascending=[False, False],
+                kind="stable",
+            )
+        else:
+            clustered = clustered.sort_values(
+                ["_cluster_number", "_priority", "_tissue"],
+                ascending=[True, False, False],
+                kind="stable",
+            )
+            rows = (
+                clustered.groupby("_cluster_text", sort=True, group_keys=False)
+                .head(max(1, int(per_cluster)))
+                .sort_values(
+                    ["_priority", "_cluster_number"],
+                    ascending=[False, True],
+                    kind="stable",
+                )
+            )
+    else:
+        rows = rows.sort_values(
+            ["_priority", "_tissue"],
+            ascending=[False, False],
+            kind="stable",
+        )
+
+    if top_n > 0:
+        rows = rows.head(int(top_n))
+    helper_columns = [
+        "_priority",
+        "_tissue",
+        "_cluster_text",
+        "_cluster_number",
+        "_patch_x",
+        "_patch_y",
+    ]
+    return rows.drop(columns=helper_columns).reset_index(drop=True), warnings
+
+
+def current_review_queue_rows(source_wsi_name: str) -> tuple[pd.DataFrame, list[str]]:
+    if st.session_state.get("patch_review_mode") != "Positive exploration":
+        return (
+            patch_queue_rows(
+                source_wsi_name,
+                str(st.session_state.get("patch_queue_sort_by", "priority_score")),
+            ),
+            [],
+        )
+    return positive_exploration_rows(
+        source_wsi_name,
+        only_unreviewed=bool(st.session_state.get("positive_only_unreviewed", True)),
+        flagged_only=bool(st.session_state.get("positive_flagged_only", False)),
+        exclude_reviewed_empty=bool(
+            st.session_state.get("positive_exclude_reviewed_empty", True)
+        ),
+        exclude_done=bool(st.session_state.get("positive_exclude_done", False)),
+        exclude_skipped=bool(st.session_state.get("positive_exclude_skipped", True)),
+        exclude_from_training=bool(
+            st.session_state.get("positive_exclude_training", True)
+        ),
+        minimum_priority_score=float(
+            st.session_state.get("positive_min_priority", 0.0)
+        ),
+        top_n=int(st.session_state.get("positive_top_n", 100)),
+        cluster_id=str(st.session_state.get("positive_cluster_filter", "all")),
+        statuses=list(st.session_state.get("positive_status_filter", [])),
+        tissue_region=str(
+            st.session_state.get("positive_tissue_region_filter", "all")
+        ),
+        disease_context=str(
+            st.session_state.get("positive_disease_context_filter", "all")
+        ),
+        source_organ=str(
+            st.session_state.get("positive_source_organ_filter", "all")
+        ),
+        sort_by=str(
+            st.session_state.get("positive_sort", "priority_score desc")
+        ),
+        per_cluster=int(st.session_state.get("positive_per_cluster", 5)),
+        random_seed=int(st.session_state.get("positive_random_seed", 42)),
+    )
 
 
 def update_patch_manifest_status(
@@ -3885,10 +4123,7 @@ def activate_adjacent_queue_patch(
     current_patch_id: str,
     offset: int,
 ) -> bool:
-    queue_rows = patch_queue_rows(
-        source_wsi_name,
-        str(st.session_state.get("patch_queue_sort_by", "priority_score")),
-    )
+    queue_rows, _ = current_review_queue_rows(source_wsi_name)
     matches = queue_rows.index[queue_rows["patch_id"] == current_patch_id].tolist()
     if not matches:
         return False
@@ -3911,6 +4146,216 @@ def activate_adjacent_queue_patch(
     return True
 
 
+def activate_review_queue_index(source_wsi_name: str, target_index: int) -> bool:
+    queue_rows, _ = current_review_queue_rows(source_wsi_name)
+    if queue_rows.empty:
+        return False
+    target_index = max(0, min(int(target_index), len(queue_rows) - 1))
+    wsi_path = ORIGINAL_WSI_DIR / source_wsi_name
+    if not wsi_path.exists():
+        return False
+    _, thumbnail_info = make_wsi_thumbnail(wsi_path)
+    target_row = queue_rows.iloc[target_index].to_dict()
+    patch = prepared_patch_from_manifest_row(target_row, wsi_path, thumbnail_info)
+    if target_row["status"] == "not_started":
+        update_patch_manifest_status(
+            source_wsi_name,
+            target_row["patch_id"],
+            "in_progress",
+        )
+    source_key = st.session_state.active_patch_source
+    if not source_key:
+        source_key = f"{source_wsi_name}:{wsi_path.stat().st_size}"
+    activate_wsi_patch(patch, source_key, target_index)
+    return True
+
+
+def render_positive_exploration_controls(
+    source_wsi_name: str,
+) -> tuple[pd.DataFrame, list[str]]:
+    manifest = load_patch_manifest()
+    source_rows = (
+        manifest.loc[manifest["source_wsi_name"].eq(source_wsi_name)].copy()
+        if not manifest.empty
+        else manifest
+    )
+    st.info(
+        "Positive explorationは陽性候補を探すための確認順です。"
+        "priority_scoreは好酸球確率ではありません。"
+    )
+    filter_row = st.columns(5)
+    filter_row[0].selectbox(
+        "source_wsi_name",
+        [source_wsi_name],
+        key="positive_source_wsi_name",
+        disabled=True,
+    )
+    filter_row[1].checkbox(
+        "未確認のみ",
+        key="positive_only_unreviewed",
+    )
+    filter_row[2].checkbox(
+        "flaggedのみ",
+        key="positive_flagged_only",
+    )
+    filter_row[3].checkbox(
+        "reviewed_emptyを除外",
+        key="positive_exclude_reviewed_empty",
+    )
+    filter_row[4].checkbox(
+        "doneを除外",
+        key="positive_exclude_done",
+    )
+
+    filter_row_2 = st.columns(4)
+    filter_row_2[0].checkbox(
+        "skippedを除外",
+        key="positive_exclude_skipped",
+    )
+    filter_row_2[1].checkbox(
+        "学習除外patchを除外",
+        key="positive_exclude_training",
+    )
+    filter_row_2[2].number_input(
+        "minimum priority_score",
+        min_value=0.0,
+        max_value=1.0,
+        step=0.01,
+        key="positive_min_priority",
+    )
+    filter_row_2[3].number_input(
+        "top N candidates",
+        min_value=1,
+        max_value=max(100, len(source_rows)),
+        step=10,
+        key="positive_top_n",
+    )
+
+    cluster_values = sorted(
+        {
+            str(value).strip()
+            for value in source_rows.get("cluster_id", pd.Series(dtype=str))
+            if str(value).strip()
+        }
+    )
+    patch_metadata = patch_metadata_lookup()
+    slide_metadata = slide_metadata_by_wsi().get(source_wsi_name, {})
+
+    def metadata_options(field: str) -> list[str]:
+        values = {
+            str(slide_metadata.get(field, "")).strip(),
+            *{
+                str(metadata.get(field, "")).strip()
+                for (wsi_name, _), metadata in patch_metadata.items()
+                if wsi_name == source_wsi_name
+            },
+        }
+        return ["all", *sorted(value for value in values if value)]
+
+    if st.session_state.get("positive_cluster_filter") not in {
+        "all",
+        *cluster_values,
+    }:
+        st.session_state.positive_cluster_filter = "all"
+    for key, field in (
+        ("positive_tissue_region_filter", "tissue_region"),
+        ("positive_disease_context_filter", "disease_context"),
+        ("positive_source_organ_filter", "source_organ"),
+    ):
+        if st.session_state.get(key) not in metadata_options(field):
+            st.session_state[key] = "all"
+
+    select_row = st.columns(4)
+    select_row[0].selectbox(
+        "cluster_id",
+        ["all", *cluster_values],
+        key="positive_cluster_filter",
+        disabled=not cluster_values,
+    )
+    select_row[1].multiselect(
+        "status",
+        PATCH_QUEUE_STATUSES,
+        key="positive_status_filter",
+    )
+    select_row[2].selectbox(
+        "tissue_region",
+        metadata_options("tissue_region"),
+        key="positive_tissue_region_filter",
+    )
+    select_row[3].selectbox(
+        "disease_context",
+        metadata_options("disease_context"),
+        key="positive_disease_context_filter",
+    )
+    select_row_2 = st.columns(4)
+    select_row_2[0].selectbox(
+        "source_organ",
+        metadata_options("source_organ"),
+        key="positive_source_organ_filter",
+    )
+    select_row_2[1].selectbox(
+        "並び順",
+        POSITIVE_SORT_OPTIONS,
+        key="positive_sort",
+    )
+    select_row_2[2].number_input(
+        "clusterごとの上位N枚",
+        min_value=1,
+        max_value=100,
+        step=1,
+        key="positive_per_cluster",
+        disabled=st.session_state.get("positive_sort") != "cluster-balanced",
+    )
+    select_row_2[3].number_input(
+        "random seed",
+        min_value=0,
+        max_value=999999,
+        step=1,
+        key="positive_random_seed",
+        disabled=st.session_state.get("positive_sort") != "random sample",
+    )
+
+    rows, warnings = current_review_queue_rows(source_wsi_name)
+    full_status_counts = (
+        source_rows["status"].value_counts().to_dict()
+        if not source_rows.empty
+        else {}
+    )
+    metrics = st.columns(4)
+    metrics[0].metric("candidate patch数", len(rows))
+    metrics[1].metric("not_started", full_status_counts.get("not_started", 0))
+    metrics[2].metric("flagged", full_status_counts.get("flagged", 0))
+    metrics[3].metric(
+        "suspected_positive",
+        full_status_counts.get("suspected_positive", 0),
+    )
+    metrics_2 = st.columns(4)
+    metrics_2[0].metric("done", full_status_counts.get("done", 0))
+    metrics_2[1].metric(
+        "reviewed_empty",
+        full_status_counts.get("reviewed_empty", 0),
+    )
+    metrics_2[2].metric("skipped", full_status_counts.get("skipped", 0))
+    metrics_2[3].metric(
+        "excluded",
+        int(
+            source_rows.get(
+                "exclude_from_training",
+                pd.Series(False, index=source_rows.index),
+            )
+            .map(safe_bool)
+            .sum()
+        ),
+    )
+    for warning in warnings:
+        st.warning(warning)
+    st.caption(
+        "運用: 好酸球なし=reviewed_empty、好酸球あり=annotation+done、"
+        "迷う=flagged/suspected_positive、artifact=skippedまたは学習除外。"
+    )
+    return rows, warnings
+
+
 def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
     try:
         wsi_path = save_uploaded_wsi(uploaded_image)
@@ -3923,8 +4368,19 @@ def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
         return None
 
     source_key = f"{uploaded_image.name}:{uploaded_image.size}"
-    queue_sort_by = str(st.session_state.get("patch_queue_sort_by", "priority_score"))
-    queue_rows = patch_queue_rows(uploaded_image.name, queue_sort_by)
+    st.radio(
+        "Patch review mode",
+        REVIEW_MODES,
+        horizontal=True,
+        key="patch_review_mode",
+    )
+    if st.session_state.patch_review_mode == "Positive exploration":
+        with st.expander("陽性探索フィルタ", expanded=True):
+            queue_rows, queue_warnings = render_positive_exploration_controls(
+                uploaded_image.name
+            )
+    else:
+        queue_rows, queue_warnings = current_review_queue_rows(uploaded_image.name)
     active_patch = st.session_state.active_patch
     if active_patch and st.session_state.active_patch_source == source_key:
         active_patch_id = active_patch.get("patch_metadata", {}).get("patch_id", "")
@@ -3943,8 +4399,22 @@ def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
                 f"cluster: {current_row['cluster_id']} | tissue_ratio: {current_row['tissue_ratio']} | "
                 f"patch_id: {active_patch_id}"
             )
+            if st.session_state.patch_review_mode == "Positive exploration":
+                st.caption(
+                    f"Positive candidate順位: {current_index + 1}/{len(queue_rows)}"
+                )
             navigation = st.columns([1, 1, 2])
-            if navigation[0].button("Previous patch", disabled=current_index <= 0, use_container_width=True):
+            previous_label = (
+                "Previous candidate"
+                if st.session_state.patch_review_mode == "Positive exploration"
+                else "Previous patch"
+            )
+            next_label = (
+                "Next positive candidate"
+                if st.session_state.patch_review_mode == "Positive exploration"
+                else "Next patch"
+            )
+            if navigation[0].button(previous_label, disabled=current_index <= 0, use_container_width=True):
                 previous_row = queue_rows.iloc[current_index - 1].to_dict()
                 previous = prepared_patch_from_manifest_row(
                     previous_row,
@@ -3956,7 +4426,7 @@ def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
                 activate_wsi_patch(previous, source_key, current_index - 1)
                 st.rerun()
             if navigation[1].button(
-                "Next patch",
+                next_label,
                 disabled=current_index >= len(queue_rows) - 1,
                 use_container_width=True,
             ):
@@ -3980,6 +4450,39 @@ def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
             st.rerun()
         apply_patch_metadata_to_session(active_patch.get("patch_metadata", {}))
         return active_patch
+
+    if (
+        st.session_state.patch_review_mode == "Positive exploration"
+        and not queue_rows.empty
+    ):
+        if st.button(
+            "陽性探索を開始 / 再開",
+            type="primary",
+            use_container_width=True,
+        ):
+            activate_review_queue_index(uploaded_image.name, 0)
+            st.rerun()
+        st.dataframe(
+            queue_rows[
+                [
+                    "patch_id",
+                    "priority_score",
+                    "tissue_ratio",
+                    "cluster_id",
+                    "status",
+                    "tissue_region",
+                    "disease_context",
+                    "source_organ",
+                ]
+            ],
+            hide_index=True,
+            use_container_width=True,
+        )
+    elif (
+        st.session_state.patch_review_mode == "Positive exploration"
+        and queue_rows.empty
+    ):
+        st.warning("現在のフィルタ条件に一致する陽性候補patchはありません。")
 
     st.subheader("WSIビューア / ROIパッチ作成")
     st.caption(
@@ -4115,7 +4618,14 @@ def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
                 " | ".join(f"{status}: {status_counts.get(status, 0)}" for status in PATCH_QUEUE_STATUSES)
             )
             start_options = queue_rows.index[
-                queue_rows["status"].isin(["not_started", "in_progress", "flagged"])
+                queue_rows["status"].isin(
+                    [
+                        "not_started",
+                        "in_progress",
+                        "flagged",
+                        "suspected_positive",
+                    ]
+                )
             ].tolist()
             start_index = int(start_options[0]) if start_options else 0
             if st.button("queueを開始 / 再開", use_container_width=True):
@@ -4835,13 +5345,15 @@ def main() -> None:
     )
     if not queue_manifest.empty and queue_mask.any():
         current_queue_status = str(queue_manifest.loc[queue_mask, "status"].iloc[0])
-        source_queue = patch_queue_rows(
-            current_wsi_name,
-            str(st.session_state.get("patch_queue_sort_by", "priority_score")),
+        source_queue, source_queue_warnings = current_review_queue_rows(
+            current_wsi_name
         )
         queue_matches = source_queue.index[source_queue["patch_id"] == current_patch_id].tolist()
         current_queue_index = int(queue_matches[0]) if queue_matches else 0
         completed = int(source_queue["status"].isin(["done", "reviewed_empty"]).sum())
+        positive_mode = (
+            st.session_state.get("patch_review_mode") == "Positive exploration"
+        )
 
         st.markdown("#### Patch queue操作")
         st.progress(
@@ -4851,6 +5363,133 @@ def main() -> None:
                 f"status: {current_queue_status}"
             ),
         )
+        if positive_mode:
+            positive_navigation = st.columns(4)
+            if positive_navigation[0].button(
+                "Previous candidate",
+                disabled=current_queue_index <= 0,
+                use_container_width=True,
+                key="positive_previous_candidate",
+            ):
+                activate_adjacent_queue_patch(
+                    current_wsi_name, current_patch_id, -1
+                )
+                st.rerun()
+            if positive_navigation[1].button(
+                "Next positive candidate",
+                disabled=current_queue_index >= len(source_queue) - 1,
+                use_container_width=True,
+                key="positive_next_candidate",
+            ):
+                activate_adjacent_queue_patch(
+                    current_wsi_name, current_patch_id, 1
+                )
+                st.rerun()
+            if positive_navigation[2].button(
+                "Mark reviewed_empty",
+                use_container_width=True,
+                key="positive_mark_empty",
+            ):
+                update_patch_manifest_status(
+                    current_wsi_name,
+                    current_patch_id,
+                    "reviewed_empty",
+                    [
+                        item
+                        for item in export_annotations
+                        if item.get("label") != "eosinophil"
+                    ],
+                )
+                activate_review_queue_index(
+                    current_wsi_name, current_queue_index
+                )
+                st.rerun()
+            if positive_navigation[3].button(
+                "Mark done",
+                use_container_width=True,
+                key="positive_mark_done",
+            ):
+                update_patch_manifest_status(
+                    current_wsi_name,
+                    current_patch_id,
+                    "done",
+                    export_annotations,
+                )
+                activate_review_queue_index(
+                    current_wsi_name, current_queue_index
+                )
+                st.rerun()
+
+            positive_status_actions = st.columns(4)
+            if positive_status_actions[0].button(
+                "Flag for review",
+                use_container_width=True,
+                key="positive_flag_review",
+            ):
+                update_patch_manifest_status(
+                    current_wsi_name,
+                    current_patch_id,
+                    "flagged",
+                    export_annotations,
+                )
+                activate_review_queue_index(
+                    current_wsi_name, current_queue_index
+                )
+                st.rerun()
+            if positive_status_actions[1].button(
+                "Mark suspected_positive",
+                use_container_width=True,
+                key="positive_suspected",
+            ):
+                update_patch_manifest_status(
+                    current_wsi_name,
+                    current_patch_id,
+                    "suspected_positive",
+                    export_annotations,
+                )
+                st.session_state.training_data_stale = True
+                activate_review_queue_index(
+                    current_wsi_name, current_queue_index
+                )
+                st.rerun()
+            if positive_status_actions[2].button(
+                "Skip",
+                use_container_width=True,
+                key="positive_skip",
+            ):
+                update_patch_manifest_status(
+                    current_wsi_name,
+                    current_patch_id,
+                    "skipped",
+                    export_annotations,
+                )
+                activate_review_queue_index(
+                    current_wsi_name, current_queue_index
+                )
+                st.rerun()
+            if positive_status_actions[3].button(
+                "Exclude from training",
+                use_container_width=True,
+                key="positive_exclude",
+            ):
+                update_training_patch(
+                    current_wsi_name,
+                    current_patch_id,
+                    {
+                        "exclude_from_training": True,
+                        "exclusion_reason": "bad_patch",
+                    },
+                )
+                st.session_state.training_data_stale = True
+                activate_review_queue_index(
+                    current_wsi_name, current_queue_index
+                )
+                st.rerun()
+            st.warning(
+                "statusや除外設定を変更した場合、CLAM export / deep feature / "
+                "mil_bagsは古くなる可能性があります。"
+            )
+
         primary_actions = st.columns(4)
         if primary_actions[0].button(
             "保存して次へ",
@@ -4877,7 +5516,13 @@ def main() -> None:
                 "done",
                 export_annotations,
             )
-            moved = activate_adjacent_queue_patch(current_wsi_name, current_patch_id, 1)
+            moved = (
+                activate_review_queue_index(current_wsi_name, current_queue_index)
+                if positive_mode
+                else activate_adjacent_queue_patch(
+                    current_wsi_name, current_patch_id, 1
+                )
+            )
             st.session_state.last_saved_message = (
                 "保存して次のpatchへ移動しました。"
                 if moved
@@ -4913,7 +5558,13 @@ def main() -> None:
                 "reviewed_empty",
                 eos_negative_annotations,
             )
-            moved = activate_adjacent_queue_patch(current_wsi_name, current_patch_id, 1)
+            moved = (
+                activate_review_queue_index(current_wsi_name, current_queue_index)
+                if positive_mode
+                else activate_adjacent_queue_patch(
+                    current_wsi_name, current_patch_id, 1
+                )
+            )
             if not moved:
                 st.session_state.annotation_table = []
                 st.session_state.canvas_objects = []

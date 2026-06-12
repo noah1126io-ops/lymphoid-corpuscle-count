@@ -186,6 +186,45 @@ queueの並び順:
 
 `priority_score`は好酸球の確率ではなく、確認候補を並べるための暫定ヒューリスティックです。染色条件や臓器によって色特徴が変わるため、人間による確認を省略する目的では使用しません。
 
+### Positive exploration mode
+
+Patch review modeを`Positive exploration`へ切り替えると、好酸球陽性patchが少なく`reviewed_empty`が多いデータセットで、陽性候補を優先して確認できます。通常の`Standard review`と同じ`patch_manifest.csv`を使用しますが、表示順とナビゲーションだけを陽性探索向けに変更します。
+
+デフォルトでは、現在のWSIに属し、学習除外されていない`not_started`、`in_progress`、`flagged`、`suspected_positive`を対象にします。`reviewed_empty`と`skipped`は除外し、`priority_score`が高い候補を先に表示します。priorityがないpatchでは`tissue_ratio`を補助的な並び順として使用します。
+
+利用できるフィルタ:
+
+- 未確認のみ、flaggedのみ
+- reviewed_empty、done、skipped、学習除外patchの除外
+- minimum priority score、top N candidates
+- cluster ID、status
+- tissue region、disease context、source organ
+
+並び順:
+
+- priority score降順
+- tissue ratio降順
+- cluster IDの後にpriority score
+- WSI上の空間順
+- random sample
+- cluster-balanced
+
+`cluster-balanced`では、clusterごとに指定した上位N枚を候補集合へ採用します。陽性patchが少ない場合、単純なpriority順だけでは似た色調・組織領域へ偏る可能性があるため、cluster-balanced samplingも併用してください。cluster IDがない場合はwarningを表示し、priority順へfallbackします。
+
+陽性探索中の推奨運用:
+
+- 好酸球なし: `reviewed_empty`
+- 好酸球あり: eosinophil annotationを保存して`done`
+- 好酸球らしいが迷う: `suspected_positive`
+- 再確認が必要、別の問題がある: `flagged`
+- 明らかなartifact: `skipped`または`exclude_from_training`
+
+`flagged`は一般的な再確認対象、`suspected_positive`は陽性らしさを理由に再確認したいpatchとして使います。どちらも自動的に陽性labelになるわけではありません。
+
+`reviewed_empty`が多いこと自体は異常ではありません。組織全体に対して好酸球が疎な場合、確認済み陰性patchが多数になるのは自然です。これらは陰性例として重要ですが、陽性探索時はデフォルトで候補から外します。
+
+`exclude_from_training`は探索表示から除外でき、YOLO、CLAM-compatible export、MIL bag indexにも入りません。statusまたは除外設定を変更した後は、既存のCLAM export、deep feature、`mil_bags.csv`が古くなる可能性があるため、必要に応じて再生成してください。
+
 将来的には、各patchの埋め込みベクトルをHDF5やNumPy形式で保存し、CLAM-compatible feature export、attention scoreのimport、cluster/attentionに基づくsamplingへ拡張する予定です。
 
 ### CLAM-compatible export
