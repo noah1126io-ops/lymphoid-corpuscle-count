@@ -279,7 +279,58 @@ data/clam/
 
 CSVにはslide/patch ID、座標、patch size、level、target mpp、encoder情報と`feature_0`以降のembedding列が入ります。ResNet18は512次元、ResNet50は2048次元です。`.pt`にはfeature tensor、patch ID、座標、encoder情報をまとめて保存します。
 
-この段階ではMIL bag生成、attention、slide-level分類、train/validation/test分割、CLAM trainingは実装していません。feature抽出前に「Validate CLAM export」でstaging CSVの整合性を確認し、slide labelと患者単位のデータ分割は研究者が別途確認してください。
+この段階ではattention、slide-level分類、train/validation/test分割、CLAM trainingは実装していません。feature抽出前に「Validate CLAM export」でstaging CSVの整合性を確認し、slide labelと患者単位のデータ分割は研究者が別途確認してください。
+
+#### Deep feature validation
+
+深層特徴の生成後、patch stagingとの整合性を検証します。
+
+```bash
+python scripts/validate_deep_features.py
+```
+
+このスクリプトは`process=1`の各slideについて、次を確認します。
+
+- patch manifest、coords CSV、deep feature CSVの`patch_id`集合
+- coordsとfeatureのpatch数
+- ResNet18の512次元、ResNet50の2048次元
+- feature値の空欄、NaN、inf
+- `feature_model`と`feature_version`
+- `.pt`が存在する場合のtensor shape、patch ID数と順序
+
+`.pt`は任意です。必須として検証する場合は`--require-pt`を付けます。不整合がある場合は終了コード1を返すため、後続処理や自動実行を停止できます。
+
+```bash
+python scripts/validate_deep_features.py --require-pt
+```
+
+#### MIL bag index
+
+validation完了後、slide単位のfeature bag一覧を作成します。
+
+```bash
+python scripts/build_mil_bag_index.py
+```
+
+出力:
+
+```text
+data/clam/mil_bags.csv
+```
+
+`slide_labels.csv`を基準に、`process=1`かつdeep feature CSVが存在するslideだけを登録します。`.pt`がなくてもCSVがあればbagとして利用できます。`patch_count`はdeep feature CSVの実際の行数から計算します。
+
+`mil_bags.csv`にはcase/slide ID、slide label、WSI名、患者・標本ID、feature CSV/PTのパス、patch数、encoder情報、確認・export日時を保存します。`label=unknown`はwarningになります。また、同じ`case_id`または`patient_id_hash`が複数slideに存在する場合、train/validation/test間の患者・症例リークを避けるためwarningを表示します。複数slideを持つ同一症例は、将来のsplit時に必ず同じpartitionへ配置してください。
+
+推奨順序:
+
+```bash
+python scripts/extract_deep_features.py --encoder resnet18 --device cpu
+python scripts/validate_deep_features.py
+python scripts/build_mil_bag_index.py
+```
+
+ここで作成するのはMIL/CLAM学習に渡すbag indexまでです。attention計算、slide-level分類、CLAM training、データ分割はまだ実装していません。
 
 ### 日時・annotation履歴
 
@@ -603,7 +654,9 @@ WSI patch workflowでは、YOLO学習画像は親NDPI/WSIではなく `data/patc
 ├── requirements.txt
 ├── requirements-ml.txt
 ├── scripts
-│   └── extract_deep_features.py
+│   ├── extract_deep_features.py
+│   ├── validate_deep_features.py
+│   └── build_mil_bag_index.py
 ├── README.md
 └── data
     ├── images
