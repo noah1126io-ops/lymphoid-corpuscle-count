@@ -347,6 +347,39 @@ StreamlitアプリのCLAM/MILセクションにある「Deep feature / MIL bag s
 
 `.pt`が空欄でもfeature CSVがあればbagとして利用できます。ただし、学習コードが`.pt`を前提とする場合はdeep feature抽出を再実行してください。`random` featureはpipelineの動作確認専用であり、学習・解析には使用しません。
 
+### Metadata修正・training除外・削除管理
+
+アプリ上部の「学習データ管理」では、保存済みannotation JSONと`patch_manifest.csv`を参照して、slide/patchのmetadataを修正できます。画像をアップロードしていない状態でも利用できます。
+
+Slide単位で編集できる項目:
+
+- `project_template`, `disease_context`, `source_organ`
+- `tissue_type`, `tissue_region`, `staining`
+- `specimen_id`, `slide_id`, `patient_id_hash`, `notes`
+- `exclude_from_training`, `exclusion_reason`
+
+Patch単位で編集できる項目:
+
+- `status`, `reviewed_at`
+- `exclude_from_training`, `exclusion_reason`, `notes`
+
+除外理由は`metadata_error`, `wrong_label`, `bad_patch`, `artifact`, `test_data`, `duplicate`, `other`から選択します。古いJSON/CSVに除外列がない場合は、`False`または空欄として読み込みます。
+
+`exclude_from_training=true`のslide/patchは、YOLO training dataset、CLAM-compatible export、MIL bag indexから除外されます。一方、`dataset_manifest.csv`には除外フラグと理由を残すため、研究データの管理履歴を確認できます。
+
+metadataや除外設定を変更すると、既存のCLAM export、deep feature、`mil_bags.csv`は古いmetadataに基づく可能性があります。画面のstale warningに従い、次の順で再生成してください。
+
+```bash
+# アプリでCLAM-compatible exportを再生成
+python scripts/extract_deep_features.py --encoder resnet18 --device cpu --overwrite
+python scripts/validate_deep_features.py
+python scripts/build_mil_bag_index.py
+```
+
+管理画面から、選択slideのdeep feature CSV/PTと、再生成可能なCLAM CSV・`mil_bags.csv`を削除できます。元NDPI/WSIは削除しません。
+
+Annotation JSONとpatch画像の物理削除は、確認チェックとpatch IDの再入力が必要です。物理削除は元に戻せないため、誤label、artifact、test dataなどは原則として`exclude_from_training`によるsoft deletionを使用してください。
+
 ### 日時・annotation履歴
 
 研究データの作成・確認・export時刻は、Asia/TokyoのISO 8601形式で自動保存します。

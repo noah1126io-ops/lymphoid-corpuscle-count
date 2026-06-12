@@ -137,6 +137,28 @@ ANNOTATION_TRACKING_FIELDS = [
     "annotation_updated_at",
     "annotation_session_id",
 ]
+EXCLUSION_REASONS = [
+    "",
+    "metadata_error",
+    "wrong_label",
+    "bad_patch",
+    "artifact",
+    "test_data",
+    "duplicate",
+    "other",
+]
+TRAINING_MANAGER_METADATA_FIELDS = [
+    "project_template",
+    "disease_context",
+    "source_organ",
+    "tissue_type",
+    "tissue_region",
+    "staining",
+    "specimen_id",
+    "slide_id",
+    "patient_id_hash",
+    "notes",
+]
 
 METADATA_FIELDS = [
     "project_template",
@@ -161,6 +183,8 @@ METADATA_FIELDS = [
     "exported",
     "reviewed_at",
     "exported_at",
+    "exclude_from_training",
+    "exclusion_reason",
     "source_wsi_name",
     "patch_id",
     "patch_x",
@@ -208,6 +232,8 @@ MANIFEST_FIELDS = [
     "eosinophil_count",
     "reviewed_at",
     "exported_at",
+    "exclude_from_training",
+    "exclusion_reason",
     "saved_at",
 ]
 REQUIRED_METADATA_FIELDS = [
@@ -376,6 +402,9 @@ PATCH_MANIFEST_FIELDS = [
     "updated_at",
     "reviewed_at",
     "exported_at",
+    "exclude_from_training",
+    "exclusion_reason",
+    "notes",
 ]
 WSI_TILE_SIZE = 256
 WSI_TILE_SERVER_PORT = 8765
@@ -605,6 +634,8 @@ def default_image_metadata(project_template: str = "ECRS_nasal_polyp") -> dict[s
         "exported": False,
         "reviewed_at": "",
         "exported_at": "",
+        "exclude_from_training": False,
+        "exclusion_reason": "",
         "source_wsi_name": "",
         "patch_id": "",
         "patch_x": "",
@@ -657,6 +688,7 @@ def init_session_state() -> None:
         "image_metadata": default_image_metadata("ECRS_nasal_polyp"),
         "region_annotations": default_region_annotations(),
         "last_template": "ECRS_nasal_polyp",
+        "training_data_stale": False,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -1602,6 +1634,11 @@ def generate_wsi_patch_queue(
                     "updated_at": tokyo_now_iso(),
                     "reviewed_at": previous.get("reviewed_at", ""),
                     "exported_at": previous.get("exported_at", ""),
+                    "exclude_from_training": previous.get(
+                        "exclude_from_training", ""
+                    ),
+                    "exclusion_reason": previous.get("exclusion_reason", ""),
+                    "notes": previous.get("notes", ""),
                 }
             )
             if progress_callback:
@@ -1672,6 +1709,11 @@ def prepared_patch_from_manifest_row(
             "reviewed_at": row.get("reviewed_at", ""),
             "exported_at": row.get("exported_at", ""),
             "patch_status": row.get("status", ""),
+            "exclude_from_training": safe_bool(
+                row.get("exclude_from_training", False)
+            ),
+            "exclusion_reason": row.get("exclusion_reason", ""),
+            "notes": row.get("notes", ""),
         },
     }
 
@@ -2261,6 +2303,10 @@ def dataset_manifest_row(
         "eosinophil_count": ecrs_counts["eosinophil_count"],
         "reviewed_at": metadata.get("reviewed_at", "") or timestamps["reviewed_at"],
         "exported_at": metadata.get("exported_at", "") or timestamps["exported_at"],
+        "exclude_from_training": safe_bool(
+            metadata.get("exclude_from_training", False)
+        ),
+        "exclusion_reason": metadata.get("exclusion_reason", ""),
         "saved_at": saved_at,
     }
 
@@ -2344,8 +2390,8 @@ def generate_yolo_training_dataset(
     exported_labels = 0
     skipped_images = []
     patch_manifest = load_patch_manifest()
-    patch_status_lookup = {
-        (row["source_wsi_name"], row["patch_id"]): row["status"]
+    patch_lookup = {
+        (row["source_wsi_name"], row["patch_id"]): row
         for _, row in patch_manifest.iterrows()
     }
 
@@ -2358,6 +2404,9 @@ def generate_yolo_training_dataset(
         )
         metadata["reviewed_at"] = metadata.get("reviewed_at", "") or timestamps["reviewed_at"]
         metadata["exported_at"] = timestamps["exported_at"] or metadata.get("exported_at", "")
+        if safe_bool(metadata.get("exclude_from_training", False)):
+            skipped_images.append(payload.get("image_name", "unknown"))
+            continue
         if only_reviewed_or_exported and not (metadata.get("reviewed") or metadata.get("exported")):
             skipped_images.append(payload.get("image_name", "unknown"))
             continue
@@ -2365,7 +2414,13 @@ def generate_yolo_training_dataset(
             str(metadata.get("source_wsi_name", "")),
             str(metadata.get("patch_id", "")),
         )
-        queue_status = patch_status_lookup.get(patch_key)
+        patch_row = patch_lookup.get(patch_key)
+        queue_status = patch_row.get("status") if patch_row is not None else None
+        if patch_row is not None and safe_bool(
+            patch_row.get("exclude_from_training", False)
+        ):
+            skipped_images.append(payload.get("image_name", "unknown"))
+            continue
         if (
             only_completed_patch_queue
             and queue_status is not None
@@ -2444,9 +2499,12 @@ def generate_clam_compatible_export(
 
     export_manifest = manifest.copy()
     skipped = 0
+    excluded_mask = export_manifest["exclude_from_training"].map(safe_bool)
+    skipped += int(excluded_mask.sum())
+    export_manifest = export_manifest.loc[~excluded_mask].copy()
     if only_completed_patches:
         completed_mask = export_manifest["status"].isin(["done", "reviewed_empty"])
-        skipped = int((~completed_mask).sum())
+        skipped += int((~completed_mask).sum())
         export_manifest = export_manifest.loc[completed_mask].copy()
 
     clam_exported_at = tokyo_now_iso()
@@ -2458,6 +2516,16 @@ def generate_clam_compatible_export(
         save_patch_manifest(manifest)
 
     metadata_lookup = slide_metadata_by_wsi()
+    if not export_manifest.empty:
+        slide_excluded = export_manifest["source_wsi_name"].map(
+            lambda source_name: safe_bool(
+                metadata_lookup.get(str(source_name), {}).get(
+                    "exclude_from_training", False
+                )
+            )
+        )
+        skipped += int(slide_excluded.sum())
+        export_manifest = export_manifest.loc[~slide_excluded].copy()
     patch_manifest_rows: list[dict[str, Any]] = []
     slide_label_rows: list[dict[str, Any]] = []
     process_rows: list[dict[str, Any]] = []
@@ -2530,6 +2598,8 @@ def generate_clam_compatible_export(
                 "patient_id_hash": patient_id_hash,
                 "wsi_path": str(wsi_path),
                 "patch_count": len(slide_rows),
+                "exclude_from_training": False,
+                "exclusion_reason": "",
                 "reviewed_at": max(
                     (str(value) for value in slide_rows["reviewed_at"] if str(value)),
                     default="",
@@ -2548,6 +2618,8 @@ def generate_clam_compatible_export(
                 "process": 1,
                 "status": "tbp",
                 "patch_count": len(slide_rows),
+                "exclude_from_training": False,
+                "exclusion_reason": "",
                 "coords_csv": str(CLAM_COORD_DIR / f"{slide_stem}.csv"),
                 "features_csv": str(CLAM_FEATURE_DIR / f"{slide_stem}.csv"),
                 "reviewed_at": max(
@@ -2979,6 +3051,255 @@ def saved_annotation_payloads() -> list[dict[str, Any]]:
     return payloads
 
 
+def saved_annotation_records() -> list[tuple[Path, dict[str, Any]]]:
+    records = []
+    for path in sorted(ANNOTATION_DIR.glob("*_annotations.json")):
+        payload = load_saved_annotation_payload(path)
+        if payload:
+            records.append((path, payload))
+    return records
+
+
+def training_slide_inventory() -> list[dict[str, Any]]:
+    slides: dict[str, dict[str, Any]] = {}
+    for path, payload in saved_annotation_records():
+        metadata = payload.get("image_metadata", {})
+        source_wsi_name = str(metadata.get("source_wsi_name", "")).strip()
+        slide_id = str(metadata.get("slide_id", "")).strip()
+        key = source_wsi_name or slide_id or str(payload.get("image_name", "")).strip()
+        if not key:
+            continue
+        row = slides.setdefault(
+            key,
+            {
+                "slide_key": key,
+                "source_wsi_name": source_wsi_name,
+                "slide_id": slide_id,
+                "annotation_files": 0,
+                "patch_count": 0,
+            },
+        )
+        row["annotation_files"] += 1
+        for field in TRAINING_MANAGER_METADATA_FIELDS:
+            value = metadata.get(field, "")
+            if str(value).strip() or field not in row:
+                row[field] = value
+        row["exclude_from_training"] = safe_bool(
+            metadata.get("exclude_from_training", False)
+        )
+        row["exclusion_reason"] = metadata.get("exclusion_reason", "")
+
+    manifest = load_patch_manifest()
+    if not manifest.empty:
+        for source_wsi_name, rows in manifest.groupby("source_wsi_name", sort=True):
+            key = str(source_wsi_name).strip()
+            row = slides.setdefault(
+                key,
+                {
+                    "slide_key": key,
+                    "source_wsi_name": key,
+                    "slide_id": Path(key).stem,
+                    "annotation_files": 0,
+                },
+            )
+            row["patch_count"] = len(rows)
+            row["excluded_patches"] = int(
+                rows["exclude_from_training"].map(safe_bool).sum()
+            )
+    for path, flag in (
+        (CLAM_DIR / "slide_labels.csv", "in_clam_export"),
+        (CLAM_MIL_BAGS_PATH, "in_mil_bags"),
+    ):
+        if not path.exists():
+            continue
+        try:
+            frame = pd.read_csv(
+                path,
+                dtype=str,
+                keep_default_na=False,
+                encoding="utf-8-sig",
+            )
+        except (OSError, pd.errors.ParserError, pd.errors.EmptyDataError):
+            continue
+        if "slide_id" not in frame.columns:
+            continue
+        for _, source_row in frame.iterrows():
+            slide_id = str(source_row.get("slide_id", "")).strip()
+            source_wsi_name = str(source_row.get("source_wsi_name", "")).strip()
+            key = source_wsi_name or slide_id
+            if not key:
+                continue
+            row = slides.setdefault(
+                key,
+                {
+                    "slide_key": key,
+                    "source_wsi_name": source_wsi_name,
+                    "slide_id": slide_id,
+                    "annotation_files": 0,
+                    "patch_count": 0,
+                },
+            )
+            row[flag] = True
+            for field in TRAINING_MANAGER_METADATA_FIELDS:
+                value = source_row.get(field, "")
+                if str(value).strip() and not str(row.get(field, "")).strip():
+                    row[field] = value
+    for row in slides.values():
+        row.setdefault("excluded_patches", 0)
+        row.setdefault("in_clam_export", False)
+        row.setdefault("in_mil_bags", False)
+    return sorted(slides.values(), key=lambda row: str(row["slide_key"]))
+
+
+def update_saved_slide_metadata(
+    slide_key: str,
+    updates: dict[str, Any],
+) -> int:
+    updated_files = 0
+    saved_at = tokyo_now_iso()
+    for path, payload in saved_annotation_records():
+        metadata = payload.get("image_metadata", {}).copy()
+        keys = {
+            str(metadata.get("source_wsi_name", "")).strip(),
+            str(metadata.get("slide_id", "")).strip(),
+            str(payload.get("image_name", "")).strip(),
+        }
+        if slide_key not in keys:
+            continue
+        metadata.update(updates)
+        payload["image_metadata"] = metadata
+        for annotation in payload.get("annotations", []):
+            for field in (*TRAINING_MANAGER_METADATA_FIELDS, "exclude_from_training", "exclusion_reason"):
+                annotation[field] = metadata.get(field, "")
+        payload["schema_version"] = "2.5"
+        payload["saved_at"] = saved_at
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        updated_files += 1
+    regenerate_dataset_exports()
+    return updated_files
+
+
+def update_training_patch(
+    source_wsi_name: str,
+    patch_id: str,
+    updates: dict[str, Any],
+) -> bool:
+    manifest = load_patch_manifest()
+    if manifest.empty:
+        return False
+    mask = (
+        manifest["source_wsi_name"].eq(source_wsi_name)
+        & manifest["patch_id"].eq(patch_id)
+    )
+    if not mask.any():
+        return False
+    for field, value in updates.items():
+        if field in PATCH_MANIFEST_FIELDS:
+            manifest.loc[mask, field] = value
+    manifest.loc[mask, "updated_at"] = tokyo_now_iso()
+    save_patch_manifest(manifest)
+
+    for path, payload in saved_annotation_records():
+        metadata = payload.get("image_metadata", {})
+        if (
+            str(metadata.get("source_wsi_name", "")) == source_wsi_name
+            and str(metadata.get("patch_id", "")) == patch_id
+        ):
+            metadata.update(
+                {
+                    "exclude_from_training": safe_bool(
+                        updates.get(
+                            "exclude_from_training",
+                            metadata.get("exclude_from_training", False),
+                        )
+                    ),
+                    "exclusion_reason": updates.get(
+                        "exclusion_reason",
+                        metadata.get("exclusion_reason", ""),
+                    ),
+                    "notes": updates.get("notes", metadata.get("notes", "")),
+                }
+            )
+            payload["image_metadata"] = metadata
+            path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+    regenerate_dataset_exports()
+    return True
+
+
+def safe_managed_delete(path: Path, allowed_root: Path) -> bool:
+    try:
+        resolved = path.resolve()
+        root = allowed_root.resolve()
+        resolved.relative_to(root)
+    except (OSError, ValueError):
+        return False
+    if not resolved.is_file():
+        return False
+    resolved.unlink()
+    return True
+
+
+def delete_generated_training_artifacts(slide_id: str, delete_global: bool) -> list[Path]:
+    deleted: list[Path] = []
+    stem = safe_file_stem(slide_id)
+    for directory, suffix in (
+        (CLAM_DEEP_FEATURE_CSV_DIR, ".csv"),
+        (CLAM_DEEP_FEATURE_PT_DIR, ".pt"),
+    ):
+        path = directory / f"{stem}{suffix}"
+        if safe_managed_delete(path, directory):
+            deleted.append(path)
+    if delete_global:
+        for path in (
+            CLAM_MIL_BAGS_PATH,
+            CLAM_DIR / "patch_manifest.csv",
+            CLAM_DIR / "slide_labels.csv",
+            CLAM_DIR / "process_list_autogen.csv",
+        ):
+            if safe_managed_delete(path, CLAM_DIR):
+                deleted.append(path)
+        for directory in (CLAM_COORD_DIR, CLAM_FEATURE_DIR):
+            for path in directory.glob("*.csv"):
+                if safe_managed_delete(path, directory):
+                    deleted.append(path)
+    return deleted
+
+
+def delete_patch_annotation_and_image(
+    source_wsi_name: str,
+    patch_id: str,
+) -> list[Path]:
+    deleted: list[Path] = []
+    for path, payload in saved_annotation_records():
+        metadata = payload.get("image_metadata", {})
+        if (
+            str(metadata.get("source_wsi_name", "")) == source_wsi_name
+            and str(metadata.get("patch_id", "")) == patch_id
+            and safe_managed_delete(path, ANNOTATION_DIR)
+        ):
+            deleted.append(path)
+
+    manifest = load_patch_manifest()
+    if not manifest.empty:
+        mask = (
+            manifest["source_wsi_name"].eq(source_wsi_name)
+            & manifest["patch_id"].eq(patch_id)
+        )
+        for value in manifest.loc[mask, "image_path"]:
+            image_path = resolve_project_data_path(value)
+            if image_path and safe_managed_delete(image_path, PATCH_IMAGE_DIR):
+                deleted.append(image_path)
+        save_patch_manifest(manifest.loc[~mask].copy())
+    regenerate_dataset_exports()
+    return deleted
+
+
 def image_size_from_payload(payload: dict[str, Any]) -> tuple[int, int] | None:
     image_size = payload.get("image_size")
     if not isinstance(image_size, dict):
@@ -3146,7 +3467,7 @@ def save_outputs(
     metadata_path = EXPORT_DIR / "metadata.csv"
 
     payload = {
-        "schema_version": "2.4",
+        "schema_version": "2.5",
         "image_name": image_name,
         "original_image_path": original_image_path,
         "export_file_stem": export_stem,
@@ -4065,6 +4386,313 @@ def update_imported_candidate_status(annotation_status: str, used_for_training: 
     st.session_state.canvas_initial_drawing_pending = True
 
 
+def render_training_data_manager() -> None:
+    with st.expander("学習データ管理", expanded=False):
+        st.caption(
+            "物理削除より、まずexclude_from_trainingによるsoft exclusionを推奨します。"
+            "元NDPI/WSIはこの画面から削除しません。"
+        )
+        slides = training_slide_inventory()
+        manifest = load_patch_manifest()
+        if not slides and manifest.empty:
+            st.info("管理対象の保存済みannotationまたはpatchがありません。")
+            return
+
+        if slides:
+            st.dataframe(
+                pd.DataFrame(slides),
+                hide_index=True,
+                use_container_width=True,
+            )
+
+        slide_options = [str(row["slide_key"]) for row in slides]
+        selected_slide = st.selectbox(
+            "編集するslide",
+            slide_options,
+            key="training_manager_slide",
+        ) if slide_options else ""
+        selected_row = next(
+            (row for row in slides if row["slide_key"] == selected_slide),
+            {},
+        )
+
+        if selected_slide:
+            st.subheader("Slide metadata")
+            with st.form("training_manager_slide_form"):
+                project_template = st.selectbox(
+                    "project_template",
+                    PROJECT_TEMPLATES,
+                    index=select_index(
+                        PROJECT_TEMPLATES,
+                        selected_row.get("project_template"),
+                        "custom",
+                    ),
+                )
+                disease_context = st.text_input(
+                    "disease_context",
+                    value=str(selected_row.get("disease_context", "unknown")),
+                )
+                source_organ = st.selectbox(
+                    "source_organ",
+                    SOURCE_ORGANS,
+                    index=select_index(
+                        SOURCE_ORGANS,
+                        selected_row.get("source_organ"),
+                        "unknown",
+                    ),
+                )
+                tissue_type = st.selectbox(
+                    "tissue_type",
+                    TISSUE_TYPES,
+                    index=select_index(
+                        TISSUE_TYPES,
+                        selected_row.get("tissue_type"),
+                        "unknown",
+                    ),
+                )
+                tissue_region = st.selectbox(
+                    "tissue_region",
+                    TISSUE_REGIONS,
+                    index=select_index(
+                        TISSUE_REGIONS,
+                        selected_row.get("tissue_region"),
+                        "unknown",
+                    ),
+                )
+                staining = st.selectbox(
+                    "staining",
+                    STAINING_OPTIONS,
+                    index=select_index(
+                        STAINING_OPTIONS,
+                        selected_row.get("staining"),
+                        "unknown",
+                    ),
+                )
+                specimen_id = st.text_input(
+                    "specimen_id",
+                    value=str(selected_row.get("specimen_id", "")),
+                )
+                slide_id = st.text_input(
+                    "slide_id",
+                    value=str(selected_row.get("slide_id", "")),
+                )
+                patient_id_hash = st.text_input(
+                    "patient_id_hash",
+                    value=str(selected_row.get("patient_id_hash", "")),
+                )
+                notes = st.text_area(
+                    "notes",
+                    value=str(selected_row.get("notes", "")),
+                )
+                exclude_slide = st.checkbox(
+                    "このslideを学習から除外",
+                    value=safe_bool(
+                        selected_row.get("exclude_from_training", False)
+                    ),
+                )
+                exclusion_reason = st.selectbox(
+                    "除外理由",
+                    EXCLUSION_REASONS,
+                    index=select_index(
+                        EXCLUSION_REASONS,
+                        selected_row.get("exclusion_reason"),
+                        "",
+                    ),
+                    disabled=not exclude_slide,
+                )
+                save_slide = st.form_submit_button(
+                    "Slide metadataを保存",
+                    use_container_width=True,
+                )
+            if save_slide:
+                updated = update_saved_slide_metadata(
+                    selected_slide,
+                    {
+                        "project_template": project_template,
+                        "disease_context": disease_context,
+                        "source_organ": source_organ,
+                        "tissue_type": tissue_type,
+                        "tissue_region": tissue_region,
+                        "staining": staining,
+                        "specimen_id": specimen_id,
+                        "slide_id": slide_id,
+                        "patient_id_hash": patient_id_hash,
+                        "notes": notes,
+                        "exclude_from_training": exclude_slide,
+                        "exclusion_reason": (
+                            exclusion_reason if exclude_slide else ""
+                        ),
+                    },
+                )
+                st.session_state.training_data_stale = True
+                st.success(f"{updated}件のannotation JSONを更新しました。")
+                st.warning(
+                    "metadataが変更されました。CLAM export、deep feature、"
+                    "mil_bagsは古い可能性があります。必要な生成物を削除し、"
+                    "CLAM exportから順に再生成してください。"
+                )
+
+        patch_rows = manifest.copy()
+        if selected_slide and not patch_rows.empty:
+            source_wsi_name = str(
+                selected_row.get("source_wsi_name", selected_slide)
+            )
+            patch_rows = patch_rows.loc[
+                patch_rows["source_wsi_name"].eq(source_wsi_name)
+            ].copy()
+        if not patch_rows.empty:
+            st.subheader("Patch管理")
+            patch_view_columns = [
+                "source_wsi_name",
+                "patch_id",
+                "status",
+                "reviewed_at",
+                "exclude_from_training",
+                "exclusion_reason",
+                "notes",
+            ]
+            st.dataframe(
+                patch_rows[patch_view_columns],
+                hide_index=True,
+                use_container_width=True,
+            )
+            patch_labels = [
+                f"{row['patch_id']} | {row['status']}"
+                for _, row in patch_rows.iterrows()
+            ]
+            selected_patch_label = st.selectbox(
+                "編集するpatch",
+                patch_labels,
+                key="training_manager_patch",
+            )
+            selected_patch_index = patch_labels.index(selected_patch_label)
+            patch_row = patch_rows.iloc[selected_patch_index]
+            with st.form("training_manager_patch_form"):
+                patch_status = st.selectbox(
+                    "status",
+                    PATCH_QUEUE_STATUSES,
+                    index=select_index(
+                        PATCH_QUEUE_STATUSES,
+                        patch_row.get("status"),
+                        "not_started",
+                    ),
+                )
+                reviewed_at = st.text_input(
+                    "reviewed_at (ISO 8601)",
+                    value=str(patch_row.get("reviewed_at", "")),
+                )
+                exclude_patch = st.checkbox(
+                    "このpatchを学習から除外",
+                    value=safe_bool(
+                        patch_row.get("exclude_from_training", False)
+                    ),
+                )
+                patch_reason = st.selectbox(
+                    "exclusion_reason",
+                    EXCLUSION_REASONS,
+                    index=select_index(
+                        EXCLUSION_REASONS,
+                        patch_row.get("exclusion_reason"),
+                        "",
+                    ),
+                    disabled=not exclude_patch,
+                )
+                patch_notes = st.text_area(
+                    "patch notes",
+                    value=str(patch_row.get("notes", "")),
+                )
+                save_patch = st.form_submit_button(
+                    "Patch設定を保存",
+                    use_container_width=True,
+                )
+            if save_patch:
+                normalized_reviewed_at = (
+                    normalize_tokyo_timestamp(reviewed_at)
+                    if reviewed_at.strip()
+                    else ""
+                )
+                update_training_patch(
+                    str(patch_row["source_wsi_name"]),
+                    str(patch_row["patch_id"]),
+                    {
+                        "status": patch_status,
+                        "reviewed_at": normalized_reviewed_at,
+                        "exclude_from_training": exclude_patch,
+                        "exclusion_reason": (
+                            patch_reason if exclude_patch else ""
+                        ),
+                        "notes": patch_notes,
+                    },
+                )
+                st.session_state.training_data_stale = True
+                st.success("Patch設定を保存しました。")
+                st.warning(
+                    "既存のCLAM/deep feature/mil_bagsは古い可能性があります。"
+                )
+
+            st.subheader("生成物の削除")
+            st.caption(
+                "選択slideのdeep featureと、必要に応じて再生成可能なCLAM CSVを削除します。"
+            )
+            delete_global = st.checkbox(
+                "CLAM再生成系CSVとmil_bags.csvも削除する",
+                key="delete_global_clam_artifacts",
+            )
+            confirm_generated = st.checkbox(
+                "生成物を削除することを確認しました",
+                key="confirm_generated_delete",
+            )
+            generated_phrase = st.text_input(
+                "確認文字: DELETE GENERATED",
+                key="generated_delete_phrase",
+            )
+            if st.button(
+                "選択slideの生成物を削除",
+                disabled=not (
+                    confirm_generated
+                    and generated_phrase == "DELETE GENERATED"
+                ),
+                use_container_width=True,
+            ):
+                deleted = delete_generated_training_artifacts(
+                    str(selected_row.get("slide_id") or Path(selected_slide).stem),
+                    delete_global,
+                )
+                st.success(f"{len(deleted)}件の生成物を削除しました。")
+
+            st.subheader("Annotation JSON / patch imageの物理削除")
+            st.error(
+                "この操作は元に戻せません。通常は学習除外を使用してください。"
+            )
+            physical_confirm = st.checkbox(
+                "物理削除が必要であることを確認しました",
+                key="confirm_physical_delete",
+            )
+            patch_id_text = st.text_input(
+                "確認のためpatch_idを入力",
+                key="physical_delete_patch_id",
+            )
+            if st.button(
+                "選択patchのannotationとpatch画像を物理削除",
+                disabled=not (
+                    physical_confirm
+                    and patch_id_text == str(patch_row["patch_id"])
+                ),
+                use_container_width=True,
+            ):
+                deleted = delete_patch_annotation_and_image(
+                    str(patch_row["source_wsi_name"]),
+                    str(patch_row["patch_id"]),
+                )
+                st.success(f"{len(deleted)}件を削除しました。元WSIは保持されています。")
+
+        if st.session_state.get("training_data_stale"):
+            st.warning(
+                "学習データ管理で変更が行われています。CLAM-compatible export、"
+                "deep feature extraction、validation、MIL bag indexを順に再実行してください。"
+            )
+
+
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     patch_drawable_canvas_for_streamlit()
@@ -4091,6 +4719,7 @@ def main() -> None:
 
     st.title(APP_TITLE)
     render_ecrs_notice(metadata.get("project_template", "custom"))
+    render_training_data_manager()
 
     if not uploaded_image:
         st.info("jpg / png / tif / tiff / ndpi / 対応WSI画像をアップロードしてください。")
@@ -4521,7 +5150,7 @@ def main() -> None:
             st.warning(warning)
 
     download_payload = {
-        "schema_version": "2.4",
+        "schema_version": "2.5",
         "image_name": st.session_state.image_name,
         "original_image_path": st.session_state.original_image_path,
         "labels": LABELS,

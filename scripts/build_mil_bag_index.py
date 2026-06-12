@@ -77,6 +77,10 @@ def cell(row: pd.Series, name: str) -> str:
     return "" if pd.isna(value) else str(value).strip()
 
 
+def truthy(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"true", "1", "yes", "y"}
+
+
 def one_value(frame: pd.DataFrame, column: str, slide_id: str) -> str:
     if column not in frame.columns:
         raise ValueError(f"{slide_id}: deep feature CSV has no {column} column.")
@@ -155,6 +159,20 @@ def main() -> int:
     for _, label_row in labels.iterrows():
         slide_id = cell(label_row, "slide_id")
         if slide_id not in enabled_slide_ids:
+            continue
+        if truthy(label_row.get("exclude_from_training", False)):
+            print(f"SKIP: {slide_id}: slide is excluded from training.")
+            continue
+
+        process_rows = process_list.loc[
+            process_list["slide_id"].fillna("").astype(str).str.strip().eq(slide_id)
+        ]
+        if (
+            not process_rows.empty
+            and "exclude_from_training" in process_rows.columns
+            and process_rows["exclude_from_training"].map(truthy).any()
+        ):
+            print(f"SKIP: {slide_id}: process list marks it excluded from training.")
             continue
 
         stem = safe_output_stem(slide_id)
