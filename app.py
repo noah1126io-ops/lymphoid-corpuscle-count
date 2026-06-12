@@ -4204,6 +4204,48 @@ def render_ecrs_notice(project_template: str) -> None:
         )
 
 
+def render_app_usage_guide() -> None:
+    with st.expander("はじめに: アプリ全体の操作ガイド", expanded=False):
+        st.markdown(
+            """
+1. **画像を選ぶ**: 通常画像はそのまま、NDPI/WSIは自動patch queueを作成してpatchを開きます。
+2. **メタデータを入力する**: 左サイドバーでテンプレート、標本ID、slide ID、臓器、染色、倍率、annotatorを確認します。
+3. **確認モードを選ぶ**: 通常レビューはqueue順、陽性探索は優先度やclusterを使った候補順です。保存されるデータ形式は同じです。
+4. **細胞を囲む**: ラベルと描画モードを選び、画像上で円または矩形を描きます。
+5. **patchを確定する**: 好酸球があれば「好酸球あり」、なければ「好酸球なし」で保存して次へ進みます。
+6. **迷うpatchを保留する**: 陽性疑い、要再確認、スキップ、学習除外は詳細操作から設定します。
+7. **学習用に出力する**: annotation作業後にYOLOまたはCLAM-compatible exportを実行します。
+"""
+        )
+        st.caption(
+            "重要: 前へ/次へは保存せず移動します。annotationを残す場合は、移動前に必ず保存ボタンを押してください。"
+        )
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "操作": "好酸球あり: 保存して次へ",
+                        "結果": "annotationを保存し、patchをdoneにして次へ",
+                    },
+                    {
+                        "操作": "好酸球なし: 陰性保存して次へ",
+                        "結果": "eosinophilを0件として保存し、reviewed_emptyにして次へ",
+                    },
+                    {
+                        "操作": "現在の内容を保存",
+                        "結果": "保存するが、現在のpatchに留まる",
+                    },
+                    {
+                        "操作": "前へ / 次へ",
+                        "結果": "保存せずに移動",
+                    },
+                ]
+            ),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+
 def apply_patch_metadata_to_session(patch_metadata: dict[str, Any]) -> None:
     st.session_state.image_metadata.update(patch_metadata)
 
@@ -4482,10 +4524,19 @@ def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
     st.session_state.active_wsi_thumbnail_info = thumbnail_info
     source_key = f"{uploaded_image.name}:{uploaded_image.size}"
     st.radio(
-        "Patch review mode",
+        "確認モード",
         REVIEW_MODES,
         horizontal=True,
         key="patch_review_mode",
+        format_func=lambda value: {
+            "Standard review": "通常レビュー",
+            "Positive exploration": "陽性探索",
+        }.get(value, value),
+        help="通常レビューはqueue順、陽性探索はpriorityやclusterで絞った候補順です。保存形式は変わりません。",
+    )
+    st.caption(
+        "通常レビューと陽性探索で保存されるannotation・metadata・statusの形式は同じです。"
+        "違うのは、次に表示するpatchの選び方だけです。"
     )
     if st.session_state.patch_review_mode == "Positive exploration":
         with st.expander("陽性探索フィルタ", expanded=True):
@@ -4518,14 +4569,14 @@ def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
                 )
             navigation = st.columns([1, 1, 2])
             previous_label = (
-                "Previous candidate"
+                "前の候補"
                 if st.session_state.patch_review_mode == "Positive exploration"
-                else "Previous patch"
+                else "前のpatch"
             )
             next_label = (
-                "Next positive candidate"
+                "次の陽性候補"
                 if st.session_state.patch_review_mode == "Positive exploration"
-                else "Next patch"
+                else "次のpatch"
             )
             if navigation[0].button(previous_label, disabled=current_index <= 0, use_container_width=True):
                 previous_row = queue_rows.iloc[current_index - 1].to_dict()
@@ -4553,7 +4604,9 @@ def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
                     update_patch_manifest_status(uploaded_image.name, following_row["patch_id"], "in_progress")
                 activate_wsi_patch(following, source_key, current_index + 1)
                 st.rerun()
-            navigation[2].caption("移動前に必要なアノテーションを保存してください。")
+            navigation[2].caption(
+                "クイック移動です。未保存のannotationは破棄されるため、確定時は画像下の保存ボタンを使用してください。"
+            )
 
         st.success(f"アノテーション用patchを読み込みました: {active_patch['image_name']}")
         if st.button("patch選択画面へ戻る", use_container_width=True):
@@ -5428,6 +5481,7 @@ def main() -> None:
     ) = render_sidebar()
 
     st.title(APP_TITLE)
+    render_app_usage_guide()
     render_ecrs_notice(metadata.get("project_template", "custom"))
     render_training_data_manager()
 
@@ -5556,6 +5610,10 @@ def main() -> None:
         )
 
         st.markdown("#### Patch queue操作")
+        st.caption(
+            "確定操作はどちらの確認モードでも共通です。"
+            "好酸球あり/なしの保存ボタンを使うと、保存とstatus更新を同時に行います。"
+        )
         st.progress(
             completed / len(source_queue) if len(source_queue) else 0,
             text=(
@@ -5573,10 +5631,15 @@ def main() -> None:
             st.session_state.saved_image_key = None
             st.rerun()
 
-        if positive_mode:
+        if positive_mode and st.toggle(
+            "詳細: 保存せずstatusだけを変更する",
+            value=False,
+            key=f"show_positive_status_only_{current_patch_id}",
+            help="通常は下の保存ボタンを使用します。annotationを保存せず、候補の状態だけ変更したい場合に開きます。",
+        ):
             positive_navigation = st.columns(4)
             if positive_navigation[0].button(
-                "Previous candidate",
+                "前の候補",
                 disabled=current_queue_index <= 0,
                 use_container_width=True,
                 key="positive_previous_candidate",
@@ -5586,7 +5649,7 @@ def main() -> None:
                 )
                 st.rerun()
             if positive_navigation[1].button(
-                "Next positive candidate",
+                "次の陽性候補",
                 disabled=current_queue_index >= len(source_queue) - 1,
                 use_container_width=True,
                 key="positive_next_candidate",
@@ -5596,7 +5659,7 @@ def main() -> None:
                 )
                 st.rerun()
             if positive_navigation[2].button(
-                "Mark reviewed_empty",
+                "statusを陰性確認済みにする",
                 use_container_width=True,
                 key="positive_mark_empty",
             ):
@@ -5615,7 +5678,7 @@ def main() -> None:
                 )
                 st.rerun()
             if positive_navigation[3].button(
-                "Mark done",
+                "statusを完了にする",
                 use_container_width=True,
                 key="positive_mark_done",
             ):
@@ -5632,7 +5695,7 @@ def main() -> None:
 
             positive_status_actions = st.columns(4)
             if positive_status_actions[0].button(
-                "Flag for review",
+                "要再確認",
                 use_container_width=True,
                 key="positive_flag_review",
             ):
@@ -5647,7 +5710,7 @@ def main() -> None:
                 )
                 st.rerun()
             if positive_status_actions[1].button(
-                "Mark suspected_positive",
+                "陽性疑い",
                 use_container_width=True,
                 key="positive_suspected",
             ):
@@ -5663,7 +5726,7 @@ def main() -> None:
                 )
                 st.rerun()
             if positive_status_actions[2].button(
-                "Skip",
+                "今回はスキップ",
                 use_container_width=True,
                 key="positive_skip",
             ):
@@ -5678,7 +5741,7 @@ def main() -> None:
                 )
                 st.rerun()
             if positive_status_actions[3].button(
-                "Exclude from training",
+                "学習から除外",
                 use_container_width=True,
                 key="positive_exclude",
             ):
@@ -5702,9 +5765,10 @@ def main() -> None:
 
         primary_actions = st.columns(4)
         if primary_actions[0].button(
-            "保存して次へ",
+            "好酸球あり: 保存して次へ",
             type="primary",
             use_container_width=True,
+            help="現在のannotationを保存し、patch statusをdoneにして次へ進みます。",
         ):
             st.session_state.image_metadata["reviewed"] = True
             st.session_state.image_metadata["exported"] = True
@@ -5739,7 +5803,11 @@ def main() -> None:
                 else "保存しました。queueの最後のpatchです。"
             )
             st.rerun()
-        if primary_actions[1].button("好酸球なしで保存して次へ", use_container_width=True):
+        if primary_actions[1].button(
+            "好酸球なし: 陰性保存して次へ",
+            use_container_width=True,
+            help="eosinophil annotationを0件として保存し、reviewed_emptyにして次へ進みます。",
+        ):
             st.session_state.image_metadata["reviewed"] = True
             st.session_state.image_metadata["exported"] = True
             eos_negative_annotations = [
@@ -5787,14 +5855,15 @@ def main() -> None:
             )
             st.rerun()
         if primary_actions[2].button(
-            "前のpatch",
+            "前の候補" if positive_mode else "前のpatch",
             disabled=current_queue_index <= 0,
+            help="保存せずに移動します。",
             use_container_width=True,
         ):
             activate_adjacent_queue_patch(current_wsi_name, current_patch_id, -1)
             st.rerun()
         if primary_actions[3].button(
-            "次のpatch",
+            "次の陽性候補" if positive_mode else "次のpatch",
             disabled=current_queue_index >= len(source_queue) - 1,
             help="未保存の変更は保存されません。",
             use_container_width=True,
@@ -5802,8 +5871,13 @@ def main() -> None:
             activate_adjacent_queue_patch(current_wsi_name, current_patch_id, 1)
             st.rerun()
 
+        st.caption("その他の処理")
         secondary_actions = st.columns(3)
-        if secondary_actions[0].button("このpatchを保存のみ", use_container_width=True):
+        if secondary_actions[0].button(
+            "現在の内容を保存（移動しない）",
+            use_container_width=True,
+            help="annotationを保存してdoneにしますが、現在のpatchに留まります。",
+        ):
             st.session_state.image_metadata["reviewed"] = True
             st.session_state.image_metadata["exported"] = True
             paths = save_outputs(
@@ -5826,11 +5900,19 @@ def main() -> None:
             )
             st.session_state.last_saved_message = "patchを保存しました: " + str(paths["annotations_json"])
             st.rerun()
-        if secondary_actions[1].button("Skipして次へ", use_container_width=True):
+        if secondary_actions[1].button(
+            "今回はスキップして次へ",
+            use_container_width=True,
+            help="annotationは確定保存せず、patch statusをskippedにします。",
+        ):
             update_patch_manifest_status(current_wsi_name, current_patch_id, "skipped", export_annotations)
             activate_adjacent_queue_patch(current_wsi_name, current_patch_id, 1)
             st.rerun()
-        if secondary_actions[2].button("要確認にして次へ", use_container_width=True):
+        if secondary_actions[2].button(
+            "要再確認にして次へ",
+            use_container_width=True,
+            help="patch statusをflaggedにし、後で再確認できるようにします。",
+        ):
             update_patch_manifest_status(current_wsi_name, current_patch_id, "flagged", export_annotations)
             activate_adjacent_queue_patch(current_wsi_name, current_patch_id, 1)
             st.rerun()
@@ -5885,12 +5967,27 @@ def main() -> None:
             update_imported_candidate_status("rejected", False)
             st.rerun()
 
-    if st.button("キャンバスを再読み込み", disabled=save_disabled, use_container_width=True):
+    st.markdown("### 現在の画像を保存")
+    st.caption(
+        "通常画像を保存する場合、またはpatch queue外で保存する場合に使用します。"
+        "patch queue作業中は、画像直下の「好酸球あり/なし」ボタンが便利です。"
+    )
+    if st.button(
+        "キャンバス表示を再読み込み",
+        disabled=save_disabled,
+        use_container_width=True,
+        help="保存データは変更せず、現在のcanvas表示だけを作り直します。",
+    ):
         st.session_state.canvas_key_version += 1
         st.session_state.canvas_initial_drawing_pending = True
         st.rerun()
 
-    if st.button("保存/export", disabled=save_disabled, use_container_width=True):
+    if st.button(
+        "現在の画像のannotationと集計を保存",
+        disabled=save_disabled,
+        use_container_width=True,
+        help="annotations JSON/CSV、counts CSV、manifest、YOLO labelを画像単位で保存します。",
+    ):
         paths = save_outputs(
             st.session_state.image_name,
             st.session_state.original_image_path,
@@ -5906,6 +6003,11 @@ def main() -> None:
         st.session_state.last_saved_message = "保存しました: " + " / ".join(str(path) for path in paths.values())
         st.rerun()
 
+    st.markdown("### 学習用データ生成")
+    st.caption(
+        "annotation作業が終わった後に実行する上級者向け操作です。"
+        "日常のpatch保存では毎回実行する必要はありません。"
+    )
     if st.button("YOLO学習用datasetを生成", use_container_width=True):
         dataset_result = generate_yolo_training_dataset(
             only_reviewed_or_exported=only_reviewed_or_exported,
@@ -5937,7 +6039,7 @@ def main() -> None:
         if clam_result["skipped"]:
             st.caption(f"未完了のため除外したpatch: {clam_result['skipped']}件")
 
-    if st.button("Validate CLAM export", use_container_width=True):
+    if st.button("CLAM exportを検証", use_container_width=True):
         validation = validate_clam_export()
         if validation["valid"]:
             st.success("CLAM-compatible CSV stagingの整合性を確認しました。")
