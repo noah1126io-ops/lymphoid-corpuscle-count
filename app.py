@@ -1751,6 +1751,89 @@ def current_review_queue_rows(source_wsi_name: str) -> tuple[pd.DataFrame, list[
     )
 
 
+def positive_filter_summary_rows(
+    source_rows: pd.DataFrame,
+    *,
+    cluster_id: str,
+    tissue_region: str,
+    disease_context: str,
+    source_organ: str,
+) -> list[dict[str, Any]]:
+    """Show how many patches remain after each positive exploration filter."""
+    if source_rows.empty:
+        return [{"filter": "source WSIの全patch", "remaining": 0}]
+
+    rows = source_rows.copy()
+    summary: list[dict[str, Any]] = [
+        {"filter": "source WSIの全patch", "remaining": len(rows)}
+    ]
+    rows["_priority"] = pd.to_numeric(
+        rows.get("priority_score", pd.Series(index=rows.index, dtype=str)),
+        errors="coerce",
+    )
+
+    if bool(st.session_state.get("positive_exclude_training", True)) and "exclude_from_training" in rows.columns:
+        rows = rows.loc[~rows["exclude_from_training"].map(safe_bool)]
+        summary.append({"filter": "学習除外patchを除外", "remaining": len(rows)})
+    if bool(st.session_state.get("positive_only_unreviewed", True)):
+        rows = rows.loc[
+            rows["status"].isin(
+                ["not_started", "in_progress", "flagged", "suspected_positive"]
+            )
+        ]
+        summary.append({"filter": "未確認・保留中のみ", "remaining": len(rows)})
+    if bool(st.session_state.get("positive_flagged_only", False)):
+        rows = rows.loc[rows["status"].isin(["flagged", "suspected_positive"])]
+        summary.append({"filter": "flagged / suspected_positiveのみ", "remaining": len(rows)})
+    if bool(st.session_state.get("positive_exclude_reviewed_empty", True)):
+        rows = rows.loc[~rows["status"].eq("reviewed_empty")]
+        summary.append({"filter": "reviewed_emptyを除外", "remaining": len(rows)})
+    if bool(st.session_state.get("positive_exclude_done", False)):
+        rows = rows.loc[~rows["status"].eq("done")]
+        summary.append({"filter": "doneを除外", "remaining": len(rows)})
+    if bool(st.session_state.get("positive_exclude_skipped", True)):
+        rows = rows.loc[~rows["status"].eq("skipped")]
+        summary.append({"filter": "skippedを除外", "remaining": len(rows)})
+
+    status_filter = list(st.session_state.get("positive_status_filter", []))
+    if status_filter:
+        rows = rows.loc[rows["status"].isin(status_filter)]
+        summary.append({"filter": "status指定", "remaining": len(rows)})
+
+    min_priority = float(st.session_state.get("positive_min_priority", 0.0))
+    if min_priority > 0:
+        rows = rows.loc[rows["_priority"].fillna(-1).ge(min_priority)]
+        summary.append(
+            {
+                "filter": f"minimum priority_score >= {min_priority:g}",
+                "remaining": len(rows),
+            }
+        )
+
+    if cluster_id != "all" and "cluster_id" in rows.columns:
+        rows = rows.loc[rows["cluster_id"].fillna("").astype(str).str.strip().eq(str(cluster_id))]
+        summary.append({"filter": "cluster_id指定", "remaining": len(rows)})
+
+    for label, field, value in (
+        ("tissue_region指定", "tissue_region", tissue_region),
+        ("disease_context指定", "disease_context", disease_context),
+        ("source_organ指定", "source_organ", source_organ),
+    ):
+        if value != "all" and field in rows.columns:
+            rows = rows.loc[rows[field].fillna("").astype(str).eq(value)]
+            summary.append({"filter": label, "remaining": len(rows)})
+
+    top_n = int(st.session_state.get("positive_top_n", 100))
+    if top_n > 0:
+        summary.append(
+            {
+                "filter": f"top N candidates = {top_n}",
+                "remaining": min(len(rows), top_n),
+            }
+        )
+    return summary
+
+
 def update_patch_manifest_status(
     source_wsi_name: str,
     patch_id: str,
@@ -4333,7 +4416,7 @@ def render_positive_exploration_controls(
         else manifest
     )
     st.info(
-        "Positive explorationは陽性候補を探すための確認順です。"
+        "陽性探索は、自動patch queueを新しく作る機能ではなく、生成済みpatch queueの絞り込み・並び替えです。"
         "priority_scoreは好酸球確率ではありません。"
     )
     filter_row = st.columns(5)
@@ -4468,7 +4551,26 @@ def render_positive_exploration_controls(
         disabled=st.session_state.get("positive_sort") != "random sample",
     )
 
+    source_rows_for_summary = source_rows.copy()
+    for field in ("tissue_region", "disease_context", "source_organ"):
+        source_rows_for_summary[field] = [
+            patch_metadata.get((source_wsi_name, str(patch_id)), {}).get(
+                field,
+                slide_metadata.get(field, ""),
+            )
+            for patch_id in source_rows_for_summary.get(
+                "patch_id", pd.Series(dtype=str)
+            )
+        ]
+
     rows, warnings = current_review_queue_rows(source_wsi_name)
+    filter_summary = positive_filter_summary_rows(
+        source_rows_for_summary,
+        cluster_id=str(st.session_state.get("positive_cluster_filter", "all")),
+        tissue_region=str(st.session_state.get("positive_tissue_region_filter", "all")),
+        disease_context=str(st.session_state.get("positive_disease_context_filter", "all")),
+        source_organ=str(st.session_state.get("positive_source_organ_filter", "all")),
+    )
     full_status_counts = (
         source_rows["status"].value_counts().to_dict()
         if not source_rows.empty
@@ -4500,6 +4602,16 @@ def render_positive_exploration_controls(
             .sum()
         ),
     )
+    with st.expander("候補数が減る理由を確認", expanded=False):
+        st.caption(
+            "陽性探索では複数のフィルタが順番に効きます。"
+            "patchが少なすぎる場合は、ここでどの条件で減ったか確認してください。"
+        )
+        st.dataframe(
+            pd.DataFrame(filter_summary),
+            hide_index=True,
+            use_container_width=True,
+        )
     for warning in warnings:
         st.warning(warning)
     st.caption(
@@ -4523,6 +4635,11 @@ def render_wsi_patch_workflow(uploaded_image: Any) -> dict[str, Any] | None:
     st.session_state.active_wsi_name = uploaded_image.name
     st.session_state.active_wsi_thumbnail_info = thumbnail_info
     source_key = f"{uploaded_image.name}:{uploaded_image.size}"
+    st.subheader("自動patch queueの確認")
+    st.caption(
+        "先に下の「自動patch queue」でpatch候補を生成します。"
+        "その後、同じqueueを通常レビューまたは陽性探索で確認します。"
+    )
     st.radio(
         "確認モード",
         REVIEW_MODES,

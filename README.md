@@ -95,7 +95,7 @@ Cellpose、Open-EoE、自前モデルなどの外部候補を取り込めるよ�
 
 ### 確認モードと保存データ
 
-`通常レビュー`と`陽性探索`で保存されるannotation、metadata、patch status、座標形式は同じです。変わるのはqueueの絞り込みと次に表示するpatchの順番だけです。
+`通常レビュー`と`陽性探索`で保存されるannotation、metadata、patch status、座標形式は同じです。変わるのはqueueの絞り込みと次に表示するpatchの順番だけです。陽性探索は自動patch queueを新しく作る機能ではなく、生成済みpatch queueを対象にした確認順の変更機能です。
 
 | 操作 | 保存 | patch status | 次へ移動 |
 | --- | --- | --- | --- |
@@ -238,6 +238,8 @@ Patch review modeを`Positive exploration`へ切り替えると、好酸球陽�
 `flagged`は一般的な再確認対象、`suspected_positive`は陽性らしさを理由に再確認したいpatchとして使います。どちらも自動的に陽性labelになるわけではありません。
 
 `reviewed_empty`が多いこと自体は異常ではありません。組織全体に対して好酸球が疎な場合、確認済み陰性patchが多数になるのは自然です。これらは陰性例として重要ですが、陽性探索時はデフォルトで候補から外します。
+
+候補が想定より少ない場合は、陽性探索フィルタ内の「候補数が減る理由を確認」を開いてください。`minimum priority_score`だけでなく、未確認のみ、reviewed_empty除外、skipped除外、status指定、metadata指定、top N candidatesなどが同時に効いている可能性があります。`minimum priority_score`を上げるほど候補は減りますが、priority未計算のpatchも除外されます。
 
 `exclude_from_training`は探索表示から除外でき、YOLO、CLAM-compatible export、MIL bag indexにも入りません。statusまたは除外設定を変更した後は、既存のCLAM export、deep feature、`mil_bags.csv`が古くなる可能性があるため、必要に応じて再生成してください。
 
