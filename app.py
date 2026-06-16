@@ -4420,6 +4420,33 @@ def activate_review_queue_index(source_wsi_name: str, target_index: int) -> bool
     return True
 
 
+def activate_next_queue_patch_after_status_change(
+    source_wsi_name: str,
+    current_patch_id: str,
+    previous_queue_index: int,
+) -> bool:
+    """Move to the next visible queue row after the current patch status changes."""
+    queue_rows, _ = current_review_queue_rows(source_wsi_name)
+    if queue_rows.empty:
+        return False
+
+    matches = queue_rows.index[queue_rows["patch_id"] == current_patch_id].tolist()
+    if matches:
+        target_index = int(matches[0]) + 1
+    else:
+        # The current row may disappear from a filtered queue after becoming
+        # reviewed_empty/skipped/done. Then the next row shifts into this index.
+        target_index = int(previous_queue_index)
+
+    if target_index < 0 or target_index >= len(queue_rows):
+        return False
+    if str(queue_rows.iloc[target_index].get("patch_id", "")) == current_patch_id:
+        target_index += 1
+    if target_index >= len(queue_rows):
+        return False
+    return activate_review_queue_index(source_wsi_name, target_index)
+
+
 def render_positive_exploration_controls(
     source_wsi_name: str,
 ) -> tuple[pd.DataFrame, list[str]]:
@@ -5817,8 +5844,10 @@ def main() -> None:
                         if item.get("label") != "eosinophil"
                     ],
                 )
-                activate_review_queue_index(
-                    current_wsi_name, current_queue_index
+                activate_next_queue_patch_after_status_change(
+                    current_wsi_name,
+                    current_patch_id,
+                    current_queue_index,
                 )
                 st.rerun()
             if positive_navigation[3].button(
@@ -5832,8 +5861,10 @@ def main() -> None:
                     "done",
                     export_annotations,
                 )
-                activate_review_queue_index(
-                    current_wsi_name, current_queue_index
+                activate_next_queue_patch_after_status_change(
+                    current_wsi_name,
+                    current_patch_id,
+                    current_queue_index,
                 )
                 st.rerun()
 
@@ -5849,8 +5880,10 @@ def main() -> None:
                     "flagged",
                     export_annotations,
                 )
-                activate_review_queue_index(
-                    current_wsi_name, current_queue_index
+                activate_next_queue_patch_after_status_change(
+                    current_wsi_name,
+                    current_patch_id,
+                    current_queue_index,
                 )
                 st.rerun()
             if positive_status_actions[1].button(
@@ -5865,8 +5898,10 @@ def main() -> None:
                     export_annotations,
                 )
                 st.session_state.training_data_stale = True
-                activate_review_queue_index(
-                    current_wsi_name, current_queue_index
+                activate_next_queue_patch_after_status_change(
+                    current_wsi_name,
+                    current_patch_id,
+                    current_queue_index,
                 )
                 st.rerun()
             if positive_status_actions[2].button(
@@ -5880,8 +5915,10 @@ def main() -> None:
                     "skipped",
                     export_annotations,
                 )
-                activate_review_queue_index(
-                    current_wsi_name, current_queue_index
+                activate_next_queue_patch_after_status_change(
+                    current_wsi_name,
+                    current_patch_id,
+                    current_queue_index,
                 )
                 st.rerun()
             if positive_status_actions[3].button(
@@ -5898,8 +5935,10 @@ def main() -> None:
                     },
                 )
                 st.session_state.training_data_stale = True
-                activate_review_queue_index(
-                    current_wsi_name, current_queue_index
+                activate_next_queue_patch_after_status_change(
+                    current_wsi_name,
+                    current_patch_id,
+                    current_queue_index,
                 )
                 st.rerun()
             st.warning(
@@ -5934,12 +5973,10 @@ def main() -> None:
                 "done",
                 export_annotations,
             )
-            moved = (
-                activate_review_queue_index(current_wsi_name, current_queue_index)
-                if positive_mode
-                else activate_adjacent_queue_patch(
-                    current_wsi_name, current_patch_id, 1
-                )
+            moved = activate_next_queue_patch_after_status_change(
+                current_wsi_name,
+                current_patch_id,
+                current_queue_index,
             )
             st.session_state.last_saved_message = (
                 "保存して次のpatchへ移動しました。"
@@ -5980,12 +6017,10 @@ def main() -> None:
                 "reviewed_empty",
                 eos_negative_annotations,
             )
-            moved = (
-                activate_review_queue_index(current_wsi_name, current_queue_index)
-                if positive_mode
-                else activate_adjacent_queue_patch(
-                    current_wsi_name, current_patch_id, 1
-                )
+            moved = activate_next_queue_patch_after_status_change(
+                current_wsi_name,
+                current_patch_id,
+                current_queue_index,
             )
             if not moved:
                 st.session_state.annotation_table = []
@@ -6050,7 +6085,11 @@ def main() -> None:
             help="annotationは確定保存せず、patch statusをskippedにします。",
         ):
             update_patch_manifest_status(current_wsi_name, current_patch_id, "skipped", export_annotations)
-            activate_adjacent_queue_patch(current_wsi_name, current_patch_id, 1)
+            activate_next_queue_patch_after_status_change(
+                current_wsi_name,
+                current_patch_id,
+                current_queue_index,
+            )
             st.rerun()
         if secondary_actions[2].button(
             "要再確認にして次へ",
@@ -6058,7 +6097,11 @@ def main() -> None:
             help="patch statusをflaggedにし、後で再確認できるようにします。",
         ):
             update_patch_manifest_status(current_wsi_name, current_patch_id, "flagged", export_annotations)
-            activate_adjacent_queue_patch(current_wsi_name, current_patch_id, 1)
+            activate_next_queue_patch_after_status_change(
+                current_wsi_name,
+                current_patch_id,
+                current_queue_index,
+            )
             st.rerun()
 
     metrics = calculate_ecrs_counts(
