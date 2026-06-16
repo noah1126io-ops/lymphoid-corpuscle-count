@@ -515,11 +515,13 @@ def render_canvas_wheel_zoom() -> None:
           <span id="zoomLabel">倍率 100%</span>
           <span style="color:#666;">画像上でマウスホイール: 拡大縮小 / スクロールバー: 移動</span>
         </div>
+        <div id="zoomStatus" style="font-size:11px;color:#777;margin-top:2px;">canvasを検索中...</div>
         <script>
         (() => {
           const parentDoc = window.parent.document;
           const selfFrame = window.frameElement;
           const label = document.getElementById("zoomLabel");
+          const status = document.getElementById("zoomStatus");
           let targetFrame = null;
           let scrollHost = null;
           let zoom = 1;
@@ -531,7 +533,10 @@ def render_canvas_wheel_zoom() -> None:
             return frames.find((frame) => {
               if (frame === selfFrame) return false;
               try {
-                return Boolean(frame.contentDocument?.querySelector("#canvas-to-streamlit"));
+                const doc = frame.contentDocument;
+                return Boolean(
+                  doc?.querySelector("#canvas-to-streamlit, canvas, .canvas-container")
+                );
               } catch (error) {
                 return false;
               }
@@ -556,9 +561,15 @@ def render_canvas_wheel_zoom() -> None:
 
           const install = () => {
             targetFrame = findCanvasFrame();
-            if (!targetFrame) return false;
+            if (!targetFrame) {
+              if (status) status.textContent = "canvasを検索中...";
+              return false;
+            }
             scrollHost = targetFrame.parentElement;
-            if (!scrollHost) return false;
+            if (!scrollHost) {
+              if (status) status.textContent = "canvasの親要素を検索中...";
+              return false;
+            }
             scrollHost.style.overflow = "auto";
             scrollHost.style.maxWidth = "100%";
             scrollHost.style.maxHeight = `${Math.min(targetFrame.offsetHeight, 900)}px`;
@@ -580,6 +591,7 @@ def render_canvas_wheel_zoom() -> None:
               targetFrame.dataset.wheelZoomInstalled = "true";
             }
             applyZoom(1);
+            if (status) status.textContent = "zoom有効";
             return true;
           };
 
@@ -596,11 +608,12 @@ def render_canvas_wheel_zoom() -> None:
           if (!install()) {
             setTimeout(install, 300);
             setTimeout(install, 900);
+            setTimeout(install, 1800);
           }
         })();
         </script>
         """,
-        height=38,
+        height=56,
     )
 
 
@@ -690,6 +703,7 @@ def init_session_state() -> None:
         "canvas_key_version": 0,
         "canvas_initial_drawing_pending": True,
         "last_saved_message": "",
+        "last_annotation_load_message": "",
         "candidate_import_key": None,
         "active_patch": None,
         "active_patch_source": None,
@@ -5094,6 +5108,9 @@ def process_upload(
             st.session_state.restored_annotations_key = restore_key
             st.session_state.canvas_key_version += 1
             st.session_state.canvas_initial_drawing_pending = True
+            st.session_state.last_annotation_load_message = (
+                f"アップロードされたannotations.jsonから{len(restored)}件を復元しました。"
+            )
     elif image_changed or st.session_state.get("force_saved_annotation_reload"):
         patch_metadata = prepared_image.get("patch_metadata", {})
         record = find_saved_annotation_record(
@@ -5134,9 +5151,15 @@ def process_upload(
             )
             st.session_state.canvas_key_version += 1
             st.session_state.canvas_initial_drawing_pending = True
+            st.session_state.last_annotation_load_message = (
+                f"保存済みannotationから{len(restored)}件を復元しました: {saved_path.name}"
+            )
         elif image_changed:
             st.session_state.annotation_table = []
             st.session_state.canvas_objects = []
+            st.session_state.last_annotation_load_message = (
+                "この画像では保存済みannotationは見つかりませんでした。"
+            )
         st.session_state.force_saved_annotation_reload = False
 
 
@@ -5176,7 +5199,10 @@ def process_candidate_import(
     st.session_state.candidate_import_key = import_key
     st.session_state.canvas_key_version += 1
     st.session_state.canvas_initial_drawing_pending = True
-    st.success(f"{len(imported)}件の候補bboxを未確認アノテーションとして読み込みました。")
+    st.session_state.last_annotation_load_message = (
+        f"{len(imported)}件の外部AI候補bboxを未確認アノテーションとして読み込みました。"
+    )
+    st.success(st.session_state.last_annotation_load_message)
 
 
 def update_imported_candidate_status(annotation_status: str, used_for_training: bool) -> None:
@@ -5656,6 +5682,8 @@ def main() -> None:
     st.caption(
         "画像上に直接アノテーションを描画してください。図形を描き終えると、カウントと保存対象が更新されます。"
     )
+    if st.session_state.get("last_annotation_load_message"):
+        st.info(st.session_state.last_annotation_load_message)
     canvas_result = st_canvas(
         fill_color="rgba(255, 255, 255, 0)",
         stroke_width=stroke_width,
@@ -5668,8 +5696,7 @@ def main() -> None:
         drawing_mode=drawing_mode,
         key=f"canvas_{st.session_state.image_name}_{st.session_state.canvas_key_version}",
     )
-    if prepared_image["source_format"] == "wsi_patch":
-        render_canvas_wheel_zoom()
+    render_canvas_wheel_zoom()
 
     if canvas_result.json_data:
         for obj in canvas_result.json_data.get("objects", []):
